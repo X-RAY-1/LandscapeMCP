@@ -1,6 +1,10 @@
 # 検証要約
 
-この文書は、各バージョンの開発時に行った検証の記録を、時系列で残したものです。レビュー前の結果や、当時のbranch名を含みます。最新の状態は末尾の「v0.3.0 公開準備の検証」を参照してください。
+この文書は、各バージョンの開発時に行った検証を、時系列で残した開発・検証記録です。仕様書ではありません。
+
+- 現在の仕様は[README](../README.md)と[Tool仕様](tools.md)を正とします。この文書の記述と食い違う場合は、そちらが正しい内容です。
+- 各節は書いた時点の状態を記録しています。レビュー前の結果、当時のbranch名、当時のTool数やVersionを含み、後から書き換えていません。
+- 最新の検証結果は、末尾の「v0.3.0 公開準備の検証」です。
 
 ## FreezeまでのE2E（2026-10-05〜2026-10-06）
 
@@ -202,7 +206,7 @@ v0.3のBinariesでEditorを起動し、空の未保存Levelに63m四方のLandsc
 
 ## v0.3.0 公開準備の検証（2026-10-06）
 
-公開準備では機能を変更していません。変更はLICENSEの追加、README・CHANGELOG・docsの整理、パッケージ設定（`Config/FilterPlugin.ini`）、Plugin descriptorの`CreatedBy`だけです。
+公開準備では機能を変更していません。変更はLICENSEの追加、README・CHANGELOG・docsの整理、Build出力の設定（`Config/FilterPlugin.ini`）、Plugin descriptorの`CreatedBy`の追加と`VersionName`の`0.3.0`への変更だけです。
 
 検証は、release branchをcloneし直したclean checkoutに対して行いました。
 
@@ -218,6 +222,8 @@ v0.3のBinariesでEditorを起動し、空の未保存Levelに63m四方のLandsc
 
 Automationは、`ToolsetRegistry`と本Pluginだけを有効にした隔離Projectで実行しました。
 
-BuildPluginの出力には次のものが含まれます。`Source`、`Binaries/Win64`（`.dll`、`.pdb`、`UnrealEditor.modules`）、`Config/FilterPlugin.ini`、`LandscapeMCP.uplugin`、`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`、`Intermediate`。配布物からは`Intermediate`と`.pdb`を除きます。`.dll`にローカルの絶対パスやユーザー名が埋め込まれていないことを確認しました。
+BuildPluginの出力には次のものが含まれます。`Source`、`Binaries/Win64`（`.dll`、`.pdb`、`UnrealEditor.modules`）、`Config/FilterPlugin.ini`、`LandscapeMCP.uplugin`、`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`、`Intermediate`。`Saved`、ログ、検証の出力は含まれません。GitHubではソースだけを配布し、Build済みのBinariesは配布しません。
+
+`VersionName`を`0.3.0`へ変更した後、clean checkoutからBuildと3 suiteのAutomationを再実行し、同じ結果を確認しました。
 
 MCP経由のE2Eは、公開準備では再実行していません。コードがv0.3のMerge時点から変わっていないためです。

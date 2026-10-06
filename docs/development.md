@@ -40,17 +40,16 @@ ProjectにBuild済みPluginと公式ToolsetRegistryを有効化し、隔離さ�
 
 MCP Serverを併用する場合は作業中Editorとportを分けます。index.jsonの成功数／失敗数と終了コードを確認してください。log・reportはGit管理外で保存します。
 
-## パッケージ
+## 配布形態
 
-配布用のパッケージは`RunUAT BuildPlugin`の出力から作ります。
+GitHubではソースだけを配布します。Build済みのBinaries（`.dll`、`.pdb`）は、リポジトリにもGitHub Releaseにも置きません。
 
-- `Config/FilterPlugin.ini`の指定により、出力には`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`、`Config/FilterPlugin.ini`が含まれます。
-- 出力の`Intermediate`は配布物に含めません。
-- `Binaries`の`.pdb`は配布物に含めません。Build時のローカルパスを含むためです。
-- 同じ理由で、配布用のBuildはユーザー名などを含まないパスで行います（`.dll`にも`.pdb`のパスが埋め込まれます）。
-- 配布物の中に`Saved`、ログ、検証の出力が入っていないことを確認します。
+`RunUAT BuildPlugin`の出力には、`Config/FilterPlugin.ini`の指定により`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`が含まれます。手元でBuildした出力を別の場所へ移すときも、ライセンスと文書が一緒に付いていきます。
 
-名前の例: `LandscapeMCP-v<version>-UE<engine version>-Win64.zip`。展開すると`LandscapeMCP`フォルダが1つ現れ、そのまま`<Project>/Plugins/`へ置ける構成にします。
+Build出力を扱うときの注意:
+
+- 出力の`Intermediate`は、Projectへ配置する必要がありません。
+- `.pdb`と`.dll`にはBuild時のローカルパスが埋め込まれます。出力を他人へ渡す場合は、この点に注意してください。
 
 ## Git / Release
 
@@ -58,4 +57,4 @@ default branchは`main`です。変更はbranchで行い、PRでレビューし�
 
 Build／Automationの失敗、secretの発見、意図しないコード差分がある場合は、Commit／Pushを止めます。Tool追加や挙動の変更では、既存のAutomation suiteをすべて再実行します。
 
-TagとGitHub Releaseは、PRのMerge後に作成します。
+TagとGitHub Releaseは、PRのMerge後に作成します。GitHub ReleaseにはBuild済みのBinariesを添付しません。

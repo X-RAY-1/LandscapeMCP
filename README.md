@@ -7,6 +7,7 @@ Unreal Engine 5.8の公式Model Context Protocol（`ToolsetRegistry` → `ModelC
 - Toolset名: `LandscapeMCP.LandscapeMCPToolset`
 - Toolset Version: `0.3`
 - 現在のリリース: v0.3.0（実験的。Plugin descriptorでも`IsExperimentalVersion`を指定しています）
+- 配布形態: ソースのみ。Build済みのBinariesは配布していません
 
 ## 概要
 
@@ -60,7 +61,7 @@ Tested:
 
 - Unreal Engine 5.8のEditor。本PluginはEditor専用で、Runtime／Cooked向けのModuleやContentは含みません
 - Unreal Engine側のModel Context Protocol環境。公式Pluginの`ToolsetRegistry`（本Pluginのdescriptorが依存を宣言）と`ModelContextProtocol`（MCPとして公開するために必要）
-- ソースからBuildする場合は、UE5.8に対応したWin64のC++ Build環境
+- UE5.8に対応したWin64のC++ Build環境。本Pluginはソースで配布しており、利用する側でのBuildが必要です
 
 他のEngineバージョン、OS、Targetは検証していません。動作は保証しません。
 
@@ -68,24 +69,18 @@ Build Moduleの依存はCore、CoreUObject、Engine、ToolsetRegistry、Landscap
 
 ## Installation
 
-配置先はどの方法でも同じです。
+本Pluginはソースで配布しています。このリポジトリにも、GitHub ReleaseにもBuild済みのBinariesは含まれません。利用するには、手元のUnreal Engine 5.8でBuildします。
+
+最終的な配置は次のとおりです。
 
 ```
 <Project>/Plugins/LandscapeMCP/
 ├── LandscapeMCP.uplugin
 ├── Source/
-└── Binaries/        （Build済みの場合）
+└── Binaries/        （Buildで生成される）
 ```
 
-### A. Build済みパッケージを使う
-
-1. Unreal Editorを終了します。
-2. パッケージを展開し、`LandscapeMCP`フォルダを`<Project>/Plugins/`へ置きます。
-3. Editorを起動します。
-
-パッケージのBinariesは、Unreal Engine 5.8 / Win64向けにBuildしたものです。Engineのビルドが一致しない場合は読み込めないので、Bの手順でBuildしてください。
-
-### B. ソース（clone / download）からBuildする
+### ソースからBuildする
 
 1. このリポジトリをcloneまたはdownloadします。
 2. `RunUAT BuildPlugin`でBuildします。出力先には、リポジトリの外の新しいフォルダを指定します。
@@ -99,7 +94,9 @@ Build Moduleの依存はCore、CoreUObject、Engine、ToolsetRegistry、Landscap
 3. Unreal Editorを終了し、出力フォルダの中身（`Intermediate`を除く）を`<Project>/Plugins/LandscapeMCP/`へ置きます。
 4. Editorを起動します。
 
-リポジトリにBinariesは含まれていません。C++ Projectであれば、`Plugins/LandscapeMCP`へソースを置いてProjectと一緒にBuildする通常の方法も使えるはずですが、この方法は検証していません。
+検証したのはこの手順です。C++ Projectであれば、`Plugins/LandscapeMCP`へソースを置いてProjectと一緒にBuildする通常の方法も使えるはずですが、この方法は検証していません。
+
+BuildしたBinariesは、Buildに使ったEngineでだけ読み込めます。Engineを更新した場合はBuildし直してください。
 
 ### Pluginの有効化と検出の確認
 
@@ -222,7 +219,7 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 
 ## Development / Testing
 
-- [開発手順](docs/development.md): 構成、Build、Automationの実行方法、パッケージの作り方
+- [開発手順](docs/development.md): 構成、Build、Automationの実行方法
 - [検証要約](docs/testing.md): これまでに行った検証の範囲と結果
 
 Automation Testは3つのsuiteがあります。

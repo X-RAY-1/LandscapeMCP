@@ -2,7 +2,7 @@
 
 ## v0.3.0 — 2026-10-06
 
-最初のPublic Release。Apache License 2.0で公開します。
+最初のPublic Release。Apache License 2.0で、ソースのみを公開します。Build済みのBinariesは配布しません。
 
 このリリースで揃っているもの:
 
@@ -19,8 +19,8 @@
 
 - `LICENSE`（Apache License 2.0）を追加
 - READMEを公開利用者向けに再構成（Requirements、Installation、MCPからの利用方法、Safety design、Limitations）
-- Build済みパッケージへ`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`を含めるよう`Config/FilterPlugin.ini`を設定
-- Plugin descriptorへ`CreatedBy`を追加
+- `RunUAT BuildPlugin`の出力へ`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`が含まれるよう`Config/FilterPlugin.ini`を設定
+- Plugin descriptorへ`CreatedBy`を追加し、`VersionName`を`0.3`から`0.3.0`へ変更（Toolset Versionは`0.3`のまま。`IsExperimentalVersion`は`true`のまま）
 - docsから公開前の運用メモを整理
 
 v0.2からの機能追加:
