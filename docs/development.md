@@ -36,7 +36,7 @@ ProjectにBuild済みPluginと公式ToolsetRegistryを有効化し、隔離さ�
   '-TestExit=Automation Test Queue Empty' '-ReportExportPath=<REPORT_DIR>'
 ```
 
-`LandscapeMCP`を指定すると、v0.1の`LandscapeMCP.V01.SafetyAndOperations`とv0.2の`LandscapeMCP.V02.TerrainAnalysis`の両方を実行します。機能追加時は既存suiteも必ず再実行してください。
+`LandscapeMCP`を指定すると、v0.1の`LandscapeMCP.V01.SafetyAndOperations`、v0.2の`LandscapeMCP.V02.TerrainAnalysis`、v0.3の`LandscapeMCP.V03.TerrainHardening`をすべて実行します。機能追加時は既存suiteも必ず再実行してください。
 
 MCP Serverを併用する場合は作業中Editorとportを分けます。index.jsonの成功数／失敗数と終了コードを確認してください。log・reportはGit管理外で保存します。
 

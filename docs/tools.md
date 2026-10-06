@@ -1,6 +1,6 @@
 # Tool仕様
 
-Toolset: `LandscapeMCP.LandscapeMCPToolset`、Version: `0.2`。v0.2は既存5 Toolの入力・出力schemaを変更せず、読み取り専用の`GetSlope`／`GetHeightRegion`／`EvaluateWalkability`を追加します。公式`describe_toolset`で現在のschemaを取得できます。ここではMCP側のlower camel case field名を記載します。C++引数・UPROPERTY名は元の識別子を保持しています。
+Toolset: `LandscapeMCP.LandscapeMCPToolset`、Version: `0.3`。v0.2で読み取り専用の`GetSlope`／`GetHeightRegion`／`EvaluateWalkability`を、v0.3で`AnalyzeSlopeNeighborhood`／`EvaluateWalkabilityRegion`を追加しました。既存Toolの入力schemaは変更していません。v0.3で`GetHeightRegion`の出力へ4 fieldを追加しています。
 
 ## 共通
 
@@ -94,13 +94,57 @@ Sample寸法は各軸`componentCount * sectionsPerComponent * quadsPerSection + 
 
 長いルートは制限内の円を重ねて作れます。path／rectangle brushや、隣接境界の歩行可能性保証はありません。
 
-## 地形評価Tool（v0.2）の共通事項
+## 地形評価Toolの共通事項
 
-`GetSlope`、`GetHeightRegion`、`EvaluateWalkability`は読み取り専用です。`bDryRun`引数はなく、Heightfield・Package・Undo履歴を変更しません。対象条件とPIE／Save／GC中の拒否は`GetHeight`と同じです。
+`GetSlope`、`GetHeightRegion`、`EvaluateWalkability`、`AnalyzeSlopeNeighborhood`、`EvaluateWalkabilityRegion`は読み取り専用です。`bDryRun`引数はなく、Heightfield・Package・Undo履歴を変更しません。対象条件とPIE／Save／GC中の拒否は`GetHeight`と同じです。
 
-3 Toolはそれぞれ専用の結果を返します。上の共通結果（`FLandscapeMCPResult`）とは別の構造で、既存5 Toolの出力は変わりません。角度は度、距離と高さはワールドcmです。
+各Toolはそれぞれ専用の結果を返します。上の共通結果（`FLandscapeMCPResult`）とは別の構造で、既存5 Toolの出力は変わりません。角度は度、距離と高さはワールドcmです。
 
 高さは`GetHeight`と同じく、単一標準Edit Layerの元Heightfieldをbilinear補間した値です。Collisionの面や法線ではありません。
+
+### 中心傾斜と局所最大傾斜
+
+このToolsetの傾斜には、定義の違う2つの系統があります。
+
+**中心傾斜**（`GetSlope.slopeDegrees`、`EvaluateWalkability.slopeDegrees`、`AnalyzeSlopeNeighborhood.centerSlopeDegrees`）は、中心から`sampleDistanceCm`離れた4点の高さの中心差分です。その場所の代表的な傾きと向きを1つの値で表します。ただし±方向の差を取るため、対称な地形では打ち消し合います。丘の頂点、尾根、V字の谷底、鞍部では、周囲が急でも0度になります。
+
+**局所最大傾斜**（`AnalyzeSlopeNeighborhood.localMaxSlopeDegrees`、`GetHeightRegion.maxTriangleSlopeDegrees`、`EvaluateWalkabilityRegion.maxSlopeDegrees`）は、Landscapeの実三角形1枚ごとの傾斜の最大値です。打ち消しが起きないので、頂点や尾根の周りの急な面を検出できます。
+
+| 地形 | 中心傾斜 | 局所最大傾斜 |
+|---|---|---|
+| 平地 | 0 | 0 |
+| 一様な斜面 | 斜面の角度 | 同じ角度 |
+| 丘の頂点・尾根・谷底・鞍部 | 0（打ち消し） | 周囲の面の角度 |
+| 4隅が[0,100,100,0]のねじれたセル | 小さい | 約54.7度 |
+
+中心傾斜の定義はv0.2から変えていません。局所最大傾斜は別のfield・別のToolとして追加しています。
+
+### 実三角形の分割
+
+UE5.8のLandscapeは、格子の1セル（頂点00、10、01、11。10はX方向、01はY方向の隣）を**対角線00-11**で2枚の三角形に分けます。
+
+```
+01 ---- 11        Lower三角形 = (00, 10, 11)
+ |    / |         Upper三角形 = (00, 01, 11)
+ |  /   |
+00 ---- 10
+```
+
+各三角形の勾配は次のとおりです。`sx`と`sy`は格子間隔（Scale.X、Scale.Y）です。
+
+```
+Lower: gx = (h10 - h00) / sx,  gy = (h11 - h10) / sy
+Upper: gx = (h11 - h01) / sx,  gy = (h01 - h00) / sy
+slopeDegrees = atan(hypot(gx, gy))
+```
+
+この分割は、Engineの描画側（`LandscapeRender.cpp`のindex順）とCollision側（Chaos `FHeightField`）のソース、およびCollisionのline traceによる実測で確認しています。4隅が[0,100,100,0]のセルの中心は、Collisionでは0cm、bilinear補間では50cmになります。同じ確認をAutomationにも入れてあります。
+
+三角形の`slopeUncertaintyDegrees`は、中心差分と同じ式に次の勾配誤差を渡して求めます。各軸の勾配は隣接2頂点の差なので、誤差は`q / 格子間隔`以下です。
+
+```
+e = hypot(q / sx, q / sy)
+```
 
 ## GetSlope
 
@@ -185,8 +229,19 @@ slopeUncertaintyDegrees = degrees(max(upper, lower))
 | `maxSlopeLocation` | `{x,y,z}` | 最大傾斜セルの中心。Zは4隅の平均高度 |
 | `heightsCm` | number[] | 全Sampleの高度。行優先（Yが外側、Xが内側） |
 | `heightQuantizationCm` | number | 高度量子化刻み、Scale.Z / 128 |
+| `bTriangleSlopeValid` | boolean | v0.3: 実三角形を評価できたか |
+| `maxTriangleSlopeDegrees` | number | v0.3: 矩形に重なる実三角形の最大傾斜 |
+| `maxTriangleSlopeLocation` | `{x,y,z}` | v0.3: その三角形の重心。Zは3頂点の平均高度 |
+| `triangleCount` | integer | v0.3: 評価した実三角形の数 |
 
 `heightsCm`の要素`ix + iy * sampleCountX`は、位置`(worldMin.x + ix * sampleSpacingCm, worldMin.y + iy * sampleSpacingCm)`の高さです。
+
+`maxSlopeDegrees`と`maxTriangleSlopeDegrees`は別の値です。
+
+- `maxSlopeDegrees`（v0.2から不変）: `sampleSpacingCm`間隔のサンプル4点で作るセルごとに、4隅の平均gradientから求めた傾斜の最大値。4隅が[0,100,100,0]のセルでは平均が打ち消し合って0になります。
+- `maxTriangleSlopeDegrees`（v0.3）: 矩形に重なるLandscapeの実三角形の最大傾斜。`sampleSpacingCm`に依存せず、矩形が少しでもかかるセルをすべて評価します。上のセルでは約54.7度になります。
+
+急な面の有無を調べるときは`maxTriangleSlopeDegrees`を使ってください。実三角形の評価に1024 Sampleの上限はかからず、v0.2で成功していた入力はそのまま成功します。
 
 `maxSlopeDegrees`は領域内で急な場所を探すための集計値です。指定間隔のセル単位なので、見つかった位置は`GetSlope`や`EvaluateWalkability`で改めて評価してください。
 
@@ -233,6 +288,16 @@ slopeUncertaintyDegrees = degrees(max(upper, lower))
 | `abs(marginDegrees) <= slopeUncertaintyDegrees` | `NEAR_LIMIT` |
 | `marginDegrees < -slopeUncertaintyDegrees` | `UNWALKABLE` |
 
+`NEAR_LIMIT`は**高さの量子化誤差に対する、測定上の区分**です。「計測値が量子化の丸めだけで閾値の反対側になり得る」ことを表し、それ以外の不確実性は一切含みません。次のものは`slopeUncertaintyDegrees`にも`NEAR_LIMIT`にも入っていません。
+
+- Collision三角形との差（中心傾斜はbilinear面の中心差分で、実際の接触面とは異なる）
+- Capsuleの形状と接地位置
+- Step Height
+- Perch（縁での乗り上げ判定）
+- 速度、Walkable Slope Overrideなど、CharacterMovementのその他の挙動
+
+したがって`WALKABLE`は「実際に歩ける」ことを、`UNWALKABLE`は「実際に進めない」ことを保証しません。実走行に対する余裕が必要な場合は、呼び出し側で`marginDegrees`にしきい値を設けてください。名称はschema互換性のためv0.2のままです。
+
 `NEAR_LIMIT`の幅は固定値ではなく、その計測の`slopeUncertaintyDegrees`です。高さは16-bitで量子化されているため、差がこの幅以内なら量子化の丸めだけで判定が反転し得ます。その範囲を「判定できない」として区別するのが目的です。Scale(100,100,100)・`sampleDistanceCm:100`の水平付近では約0.32度です。この幅はCollision三角形との差やCharacter側の要因を含みません。安全側に余裕を取る場合は、呼び出し側で`marginDegrees`にしきい値を設けてください。`NEAR_LIMIT`でも`bWalkable`は`marginDegrees >= 0`のまま返します。
 
 ```json
@@ -241,8 +306,95 @@ slopeUncertaintyDegrees = degrees(max(upper, lower))
 
 約47度の斜面をWalkable Floor Angle 44.77度で評価すると、`bWalkable:false`、`marginDegrees`は約-2.2、`classification:"UNWALKABLE"`になります。
 
+## AnalyzeSlopeNeighborhood
+
+| 入力 | 型 / 制約 |
+|---|---|
+| `landscapePath` | string、読み込み済みActorの完全Object Path |
+| `worldX` / `worldY` | number、Landscape内のWorld XY |
+| `radiusCm` | number、(0,5000]。局所傾斜を集計する半径 |
+| `sampleDistanceCm` | number、[1,5000]。中心傾斜の中心差分に使う距離。`GetSlope`と同じ意味 |
+
+中心傾斜と局所傾斜を1回で返します。
+
+- 中心傾斜は`GetSlope`と同じ計算です。同じ`sampleDistanceCm`なら同じ値になります。4点がLandscape内に揃わない場合はFAILします。
+- 局所傾斜は、重心が中心から`radiusCm`以内にある実三角形を集計します。中心を含むセルの2枚は、半径が1セルより小さくても必ず含めます。
+
+| 出力 | 型 | 意味 |
+|---|---|---|
+| `bSuccess` / `landscapePath` / `message` | | 共通 |
+| `worldX` / `worldY` / `radiusCm` / `sampleDistanceCm` | number | 入力値 |
+| `centerSlopeDegrees` | number | 中心傾斜。`GetSlope.slopeDegrees`と同じ |
+| `centerSlopeDirectionDegrees` / `bCenterDirectionValid` | number / boolean | 中心傾斜の最大上昇方向と、その有効性 |
+| `centerSlopeUncertaintyDegrees` | number | 中心傾斜の量子化誤差上限 |
+| `heightCenterCm` | number | 中心の高さ |
+| `localMaxSlopeDegrees` | number | 半径内の実三角形の最大傾斜 |
+| `localMeanSlopeDegrees` | number | 同じ三角形群の平均傾斜（三角形はXY面積が等しいので面積加重平均） |
+| `maxSlopeLocation` | `{x,y,z}` | 最大傾斜の三角形の重心。Zは3頂点の平均高度 |
+| `maxSlopeDirectionDegrees` / `bMaxSlopeDirectionValid` | number / boolean | その三角形の最大上昇方向 |
+| `localMaxSlopeUncertaintyDegrees` | number | その三角形の量子化誤差上限 |
+| `triangleCount` | integer | 集計した実三角形の数 |
+| `sampleCount` | integer | 読み取ったHeightfield頂点数 |
+| `bClipped` | boolean | 半径がLandscape端を越え、評価範囲が端で切られた場合true |
+| `heightQuantizationCm` | number | 高度量子化刻み |
+
+読み取りは最大16384頂点です。超える場合はFAILするので半径を小さくしてください。半径がLandscape端を越える部分には地形がないため、評価範囲から外して`bClipped:true`を返します。
+
+想定入力にあった`sampleSpacingCm`は採用していません。局所傾斜はLandscapeの実三角形そのものを使うため、サンプル間隔を指定する余地がないからです。代わりに、中心傾斜の計測距離を`GetSlope`と同じ名前の`sampleDistanceCm`で受け取ります。
+
+```json
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_TestLandscape","worldX":3000,"worldY":3000,"radiusCm":300,"sampleDistanceCm":100}
+```
+
+丘の頂点では`centerSlopeDegrees`が0、`localMaxSlopeDegrees`が周囲の面の角度になります。
+
+## EvaluateWalkabilityRegion
+
+| 入力 | 型 / 制約 |
+|---|---|
+| `landscapePath` | string、読み込み済みActorの完全Object Path |
+| `minX` / `minY` / `maxX` / `maxY` | number、World XYの矩形。`max >= min`。矩形全体がLandscape内 |
+| `walkableFloorAngleDeg` | number、[0,90]。呼び出し側が指定する歩行可能角 |
+
+矩形が少しでもかかるセルの実三角形すべてを、`EvaluateWalkability`と同じ規則で1枚ずつ分類して集計します。**Landscape形状の評価であり、CharacterMovementを参照・変更しません。** 特定のCharacter Blueprintから角度を読むこともありません。
+
+| 出力 | 型 | 意味 |
+|---|---|---|
+| `bSuccess` / `landscapePath` / `message` | | 共通。`bSuccess`は評価できたかどうかで、歩行可能かどうかではない |
+| `walkableFloorAngleDeg` | number | 入力値 |
+| `sampleCount` | integer | 読み取ったHeightfield頂点数 |
+| `triangleCount` | integer | 評価した実三角形の数 |
+| `walkableCount` / `nearLimitCount` / `unwalkableCount` | integer | 三角形ごとの分類数。合計は`triangleCount` |
+| `walkableRatio` | number | `walkableCount / triangleCount`。`NEAR_LIMIT`は含めない |
+| `maxSlopeDegrees` | number | 実三角形の最大傾斜 |
+| `worstMarginDegrees` | number | `walkableFloorAngleDeg - maxSlopeDegrees`。負なら超過 |
+| `worstLocation` | `{x,y,z}` | 最大傾斜の三角形の重心 |
+| `worstSlopeDirectionDegrees` / `bWorstSlopeDirectionValid` | number / boolean | その三角形の最大上昇方向 |
+| `slopeUncertaintyDegrees` | number | その三角形の量子化誤差上限 |
+| `classification` | string | `WALKABLE` / `MIXED` / `UNWALKABLE` |
+| `worldMin` / `worldMax` | `{x,y,z}` | 評価した三角形群のXY範囲（セル単位へ広げた範囲）と高度範囲 |
+| `heightQuantizationCm` | number | 高度量子化刻み |
+
+領域の`classification`は次の規則です。
+
+| 条件 | classification |
+|---|---|
+| 全三角形が`WALKABLE` | `WALKABLE` |
+| 全三角形が`UNWALKABLE` | `UNWALKABLE` |
+| それ以外（`NEAR_LIMIT`が1枚でもある場合を含む） | `MIXED` |
+
+`WALKABLE`は「量子化誤差を見込んでも全面が歩行可能角以下」という意味に限っています。`NEAR_LIMIT`を歩行可能側に数えないのは、判定できない面を含む領域を全面歩行可能と報告しないためです。
+
+読み取りは最大16384頂点（例: 127×127セル）です。超える場合はFAILするので領域を分割してください。矩形はclipされず、少しでも範囲外ならFAILします。`min == max`の点や線を渡した場合は、それを含むセルを評価します。
+
+想定入力にあった`sampleSpacingCm`は採用していません。評価対象がLandscapeの実三角形そのもので、解像度は格子間隔で決まるためです。
+
+```json
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_TestLandscape","minX":2400,"minY":2400,"maxX":3600,"maxY":3600,"walkableFloorAngleDeg":44.77}
+```
+
 ## 共通Validation
 
-地形評価Toolは、`sampleDistanceCm`／`sampleSpacingCm`が[1,5000]の範囲外、`walkableFloorAngleDeg`が[0,90]の範囲外、矩形の逆転、1024 Sample超過、計測点または矩形の範囲外をFAILとします。clipは行いません。
+地形評価Toolは、`sampleDistanceCm`／`sampleSpacingCm`が[1,5000]の範囲外、`radiusCm`が(0,5000]の範囲外、`walkableFloorAngleDeg`が[0,90]の範囲外、矩形の逆転、`GetHeightRegion`の1024 Sample超過、`AnalyzeSlopeNeighborhood`／`EvaluateWalkabilityRegion`の16384頂点超過、計測点または矩形の範囲外をFAILとします。clipするのは`AnalyzeSlopeNeighborhood`の半径だけです。
 
 すべてのToolは[safety](safety.md)の対象条件を満たす必要があります。座標はfiniteかつ絶対値10000000cm以下。NaN／Infinity、異常Scale、高度overflowを拒否します。ブラシ中心の範囲外はFAIL、円の縁だけの範囲外はclip。編集読み取り上限は16384 Sampleで、超えたら半径を縮める必要があります。1 Sampleも円に含まれない場合はFAILです。

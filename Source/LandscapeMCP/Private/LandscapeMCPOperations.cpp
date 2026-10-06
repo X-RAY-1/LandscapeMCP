@@ -416,14 +416,16 @@ namespace
         double UncertaintyDegrees = 0;
     };
     // GetSlopeとEvaluateWalkabilityが同じ定義を使うための共通経路。
-    bool MeasureSlope(const FString& Path, double X, double Y, double D, FSlopeMeasurement& Out, FString& Error)
+    bool SlopeInputValid(double X, double Y, double D, FString& Error)
     {
         if (!Coordinate(X) || !Coordinate(Y)) { Error = TEXT("Non-finite / out-of-range world XY."); return false; }
         if (!FMath::IsFinite(D) || D < MinSampleDistance || D > MaxSampleDistance)
         { Error = TEXT("SampleDistanceCm must be finite and within [1,5000]."); return false; }
-        FTarget T;
-        if (!Resolve(Path,T,Error)) { return false; }
-        FSourceReader Reader(T); bool bOutside = false;
+        return true;
+    }
+    bool MeasureSlopeAt(const FTarget& T, FSourceReader& Reader, double X, double Y, double D, FSlopeMeasurement& Out, FString& Error)
+    {
+        bool bOutside = false;
         if (!SampleHeight(T,Reader,X,Y,Out.HeightCenterCm,bOutside,Error))
         { if (bOutside) { Error = TEXT("Query point is outside Landscape."); } return false; }
         double XMinus = 0, XPlus = 0, YMinus = 0, YPlus = 0;
@@ -440,6 +442,51 @@ namespace
         if (!FMath::IsFinite(Out.Slope.SlopeDegrees) || !FMath::IsFinite(Out.Slope.DirectionDegrees))
         { Error = TEXT("Slope evaluation produced a non-finite value."); return false; }
         return true;
+    }
+    bool MeasureSlope(const FString& Path, double X, double Y, double D, FSlopeMeasurement& Out, FString& Error)
+    {
+        if (!SlopeInputValid(X,Y,D,Error)) { return false; }
+        FTarget T;
+        if (!Resolve(Path,T,Error)) { return false; }
+        FSourceReader Reader(T);
+        return MeasureSlopeAt(T,Reader,X,Y,D,Out,Error);
+    }
+    constexpr int32 MaxAnalysisVertices = MaxEditSamples;
+    // 実三角形の評価に使う頂点格子。Rectは頂点座標で最大値を含む。Heightsは行優先のワールドZ。
+    struct FTriangleGrid
+    {
+        FIntRect Rect;
+        int32 CountX = 0;
+        int32 CountY = 0;
+        TArray<double> Heights;
+    };
+    // Landscape格子座標の矩形に重なるセルを覆う頂点格子を読む。範囲外はLandscape内へ収め、各軸1セル以上にする。
+    bool ReadTriangleGrid(const FTarget& T, FSourceReader& Reader, FVector2D LocalMin, FVector2D LocalMax, int32 MaxVertices,
+        FTriangleGrid& Out, FString& Error)
+    {
+        FIntRect Rect;
+        Rect.Min.X = FMath::Clamp(FMath::FloorToInt32(LocalMin.X),T.Extent.Min.X,T.Extent.Max.X-1);
+        Rect.Min.Y = FMath::Clamp(FMath::FloorToInt32(LocalMin.Y),T.Extent.Min.Y,T.Extent.Max.Y-1);
+        Rect.Max.X = FMath::Clamp(FMath::CeilToInt32(LocalMax.X),Rect.Min.X+1,T.Extent.Max.X);
+        Rect.Max.Y = FMath::Clamp(FMath::CeilToInt32(LocalMax.Y),Rect.Min.Y+1,T.Extent.Max.Y);
+        const int64 CountX = int64(Rect.Max.X)-Rect.Min.X+1, CountY = int64(Rect.Max.Y)-Rect.Min.Y+1;
+        if (CountX*CountY > MaxVertices)
+        { Error = TEXT("Analysis exceeds 16384 heightfield vertices; reduce the radius or split the region."); return false; }
+        TArray<uint16> Raw;
+        if (!Reader.Region(Rect,Raw,Error)) { return false; }
+        Out.Rect = Rect; Out.CountX = int32(CountX); Out.CountY = int32(CountY);
+        Out.Heights.SetNumUninitialized(Raw.Num());
+        for (int32 Index = 0; Index < Raw.Num(); ++Index) { Out.Heights[Index] = WorldHeight(T,Raw[Index]); }
+        return true;
+    }
+    // 三角形の重心のワールド位置。Zは3頂点の平均高度。
+    FVector TriangleLocation(const FTarget& T, const FTriangleGrid& Grid, int32 CellX, int32 CellY, bool bUpper)
+    {
+        const FVector2D Centroid = Analysis::TriangleCentroid(Grid.Rect.Min.X+CellX,Grid.Rect.Min.Y+CellY,bUpper);
+        const int32 Base = CellY*Grid.CountX + CellX;
+        const double Third = bUpper ? Grid.Heights[Base+Grid.CountX] : Grid.Heights[Base+1];
+        return FVector(T.Origin.X+Centroid.X*T.Scale.X, T.Origin.Y+Centroid.Y*T.Scale.Y,
+            (Grid.Heights[Base]+Grid.Heights[Base+Grid.CountX+1]+Third)/3.0);
     }
 }
 
@@ -526,8 +573,107 @@ FLandscapeMCPHeightRegionResult HeightRegion(const FString& Path, double MinX, d
             (Heights[Base]+Heights[Base+1]+Heights[Base+NX]+Heights[Base+NX+1])/4.0);
     }
     R.HeightQuantizationCm = T.Scale.Z/128;
+    {
+        FTriangleGrid Grid;
+        if (!ReadTriangleGrid(T,Reader,LocalMin,LocalMax,TNumericLimits<int32>::Max(),Grid,Error))
+        { FLandscapeMCPHeightRegionResult Failed; Failed.LandscapePath = Path; Failed.SampleSpacingCm = SpacingCm; Failed.Message = Error; return Failed; }
+        const Analysis::FTriangleStats Triangles = Analysis::ComputeTriangleStats(Grid.Heights,Grid.CountX,Grid.CountY,T.Scale.X,T.Scale.Y,
+            90.0,0.0,[](int32,int32,bool) { return true; });
+        R.bTriangleSlopeValid = Triangles.TriangleCount > 0;
+        R.TriangleCount = Triangles.TriangleCount;
+        if (R.bTriangleSlopeValid)
+        {
+            R.MaxTriangleSlopeDegrees = Triangles.MaxSlopeDegrees;
+            R.MaxTriangleSlopeLocation = TriangleLocation(T,Grid,Triangles.MaxCellX,Triangles.MaxCellY,Triangles.bMaxIsUpper);
+        }
+    }
     R.HeightsCm = MoveTemp(Heights);
     R.Message = TEXT("Read-only bilinear source heights on a regular grid (row-major, Y outer). No package or transaction changes.");
+    return R;
+}
+
+FLandscapeMCPSlopeNeighborhoodResult SlopeNeighborhood(const FString& Path, double X, double Y, double RadiusCm, double SampleDistanceCm)
+{
+    FLandscapeMCPSlopeNeighborhoodResult R; R.LandscapePath = Path; R.WorldX = X; R.WorldY = Y;
+    R.RadiusCm = RadiusCm; R.SampleDistanceCm = SampleDistanceCm;
+    FString Error;
+    if (!SlopeInputValid(X,Y,SampleDistanceCm,Error)) { R.Message = Error; return R; }
+    if (!FMath::IsFinite(RadiusCm) || RadiusCm <= 0 || RadiusCm > MaxRadius)
+    { R.Message = TEXT("RadiusCm must be finite and within (0,5000]."); return R; }
+    FTarget T;
+    if (!Resolve(Path,T,Error)) { R.Message = Error; return R; }
+    FSourceReader Reader(T); FSlopeMeasurement M;
+    // 中心傾斜はGetSlopeと同じ経路で測る。端で4点が揃わない場合は全体を拒否する。
+    if (!MeasureSlopeAt(T,Reader,X,Y,SampleDistanceCm,M,Error)) { R.Message = Error; return R; }
+    const FVector2D Local((X-T.Origin.X)/T.Scale.X,(Y-T.Origin.Y)/T.Scale.Y);
+    const FVector2D Reach(RadiusCm/T.Scale.X,RadiusCm/T.Scale.Y);
+    const FVector2D RequestMin = Local-Reach, RequestMax = Local+Reach;
+    FTriangleGrid Grid;
+    if (!ReadTriangleGrid(T,Reader,RequestMin,RequestMax,MaxAnalysisVertices,Grid,Error)) { R.Message = Error; return R; }
+    const int32 CenterCellX = FMath::Clamp(FMath::FloorToInt32(Local.X),T.Extent.Min.X,T.Extent.Max.X-1) - Grid.Rect.Min.X;
+    const int32 CenterCellY = FMath::Clamp(FMath::FloorToInt32(Local.Y),T.Extent.Min.Y,T.Extent.Max.Y-1) - Grid.Rect.Min.Y;
+    const double RadiusSquared = RadiusCm*RadiusCm;
+    const Analysis::FTriangleStats S = Analysis::ComputeTriangleStats(Grid.Heights,Grid.CountX,Grid.CountY,T.Scale.X,T.Scale.Y,
+        90.0,T.Scale.Z/128,[&](int32 CellX,int32 CellY,bool bUpper)
+        {
+            // 半径が1セルより小さくても、中心を含むセルの2枚は必ず評価する。
+            if (CellX == CenterCellX && CellY == CenterCellY) { return true; }
+            const FVector2D Centroid = Analysis::TriangleCentroid(Grid.Rect.Min.X+CellX,Grid.Rect.Min.Y+CellY,bUpper);
+            const double DX = T.Origin.X+Centroid.X*T.Scale.X-X, DY = T.Origin.Y+Centroid.Y*T.Scale.Y-Y;
+            return DX*DX+DY*DY <= RadiusSquared;
+        });
+    if (S.TriangleCount == 0 || !FMath::IsFinite(S.MaxSlopeDegrees) || !FMath::IsFinite(S.MeanSlopeDegrees))
+    { R.Message = TEXT("Neighborhood slope could not be evaluated."); return R; }
+    R.bSuccess = true;
+    R.CenterSlopeDegrees = M.Slope.SlopeDegrees; R.CenterSlopeDirectionDegrees = M.Slope.DirectionDegrees;
+    R.bCenterDirectionValid = M.Slope.bDirectionValid; R.CenterSlopeUncertaintyDegrees = M.UncertaintyDegrees;
+    R.HeightCenterCm = M.HeightCenterCm; R.HeightQuantizationCm = M.QuantizationCm;
+    R.LocalMaxSlopeDegrees = S.MaxSlopeDegrees; R.LocalMeanSlopeDegrees = S.MeanSlopeDegrees;
+    R.MaxSlopeLocation = TriangleLocation(T,Grid,S.MaxCellX,S.MaxCellY,S.bMaxIsUpper);
+    R.MaxSlopeDirectionDegrees = S.MaxSlope.DirectionDegrees; R.bMaxSlopeDirectionValid = S.MaxSlope.bDirectionValid;
+    R.LocalMaxSlopeUncertaintyDegrees = S.MaxSlopeUncertaintyDegrees;
+    R.TriangleCount = S.TriangleCount; R.SampleCount = Grid.Heights.Num();
+    R.bClipped = RequestMin.X < T.Extent.Min.X || RequestMin.Y < T.Extent.Min.Y
+        || RequestMax.X > T.Extent.Max.X || RequestMax.Y > T.Extent.Max.Y;
+    R.Message = TEXT("Read-only: centre slope is the GetSlope central difference; local slopes come from the Landscape triangles (diagonal 00-11) within the radius. No package or transaction changes.");
+    return R;
+}
+
+FLandscapeMCPWalkabilityRegionResult WalkabilityRegion(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, double WalkableFloorAngleDeg)
+{
+    FLandscapeMCPWalkabilityRegionResult R; R.LandscapePath = Path; R.WalkableFloorAngleDeg = WalkableFloorAngleDeg;
+    if (!Coordinate(MinX) || !Coordinate(MinY) || !Coordinate(MaxX) || !Coordinate(MaxY))
+    { R.Message = TEXT("Non-finite / out-of-range region bounds."); return R; }
+    if (MaxX < MinX || MaxY < MinY) { R.Message = TEXT("Reversed region bounds: max must be >= min."); return R; }
+    if (!FMath::IsFinite(WalkableFloorAngleDeg) || WalkableFloorAngleDeg < 0 || WalkableFloorAngleDeg > 90)
+    { R.Message = TEXT("WalkableFloorAngleDeg must be finite and within [0,90]."); return R; }
+    FTarget T; FString Error;
+    if (!Resolve(Path,T,Error)) { R.Message = Error; return R; }
+    const FVector2D LocalMin((MinX-T.Origin.X)/T.Scale.X,(MinY-T.Origin.Y)/T.Scale.Y);
+    const FVector2D LocalMax((MaxX-T.Origin.X)/T.Scale.X,(MaxY-T.Origin.Y)/T.Scale.Y);
+    if (!Contains(T.Extent,LocalMin) || !Contains(T.Extent,LocalMax))
+    { R.Message = TEXT("Region is not fully inside Landscape; it is not clipped."); return R; }
+    FSourceReader Reader(T); FTriangleGrid Grid;
+    if (!ReadTriangleGrid(T,Reader,LocalMin,LocalMax,MaxAnalysisVertices,Grid,Error)) { R.Message = Error; return R; }
+    const Analysis::FTriangleStats S = Analysis::ComputeTriangleStats(Grid.Heights,Grid.CountX,Grid.CountY,T.Scale.X,T.Scale.Y,
+        WalkableFloorAngleDeg,T.Scale.Z/128,[](int32,int32,bool) { return true; });
+    if (S.TriangleCount == 0 || !FMath::IsFinite(S.MaxSlopeDegrees))
+    { R.Message = TEXT("Region walkability could not be evaluated."); return R; }
+    double MinZ = Grid.Heights[0], MaxZ = Grid.Heights[0];
+    for (double H : Grid.Heights) { MinZ = FMath::Min(MinZ,H); MaxZ = FMath::Max(MaxZ,H); }
+    R.bSuccess = true;
+    R.SampleCount = Grid.Heights.Num(); R.TriangleCount = S.TriangleCount;
+    R.WalkableCount = S.WalkableCount; R.NearLimitCount = S.NearLimitCount; R.UnwalkableCount = S.UnwalkableCount;
+    R.WalkableRatio = double(S.WalkableCount)/S.TriangleCount;
+    R.MaxSlopeDegrees = S.MaxSlopeDegrees; R.WorstMarginDegrees = WalkableFloorAngleDeg - S.MaxSlopeDegrees;
+    R.WorstLocation = TriangleLocation(T,Grid,S.MaxCellX,S.MaxCellY,S.bMaxIsUpper);
+    R.WorstSlopeDirectionDegrees = S.MaxSlope.DirectionDegrees; R.bWorstSlopeDirectionValid = S.MaxSlope.bDirectionValid;
+    R.SlopeUncertaintyDegrees = S.MaxSlopeUncertaintyDegrees;
+    R.Classification = Analysis::ToString(Analysis::ClassifyRegion(S));
+    R.WorldMin = FVector(T.Origin.X+Grid.Rect.Min.X*T.Scale.X,T.Origin.Y+Grid.Rect.Min.Y*T.Scale.Y,MinZ);
+    R.WorldMax = FVector(T.Origin.X+Grid.Rect.Max.X*T.Scale.X,T.Origin.Y+Grid.Rect.Max.Y*T.Scale.Y,MaxZ);
+    R.HeightQuantizationCm = T.Scale.Z/128;
+    R.Message = TEXT("Read-only geometry evaluation of the Landscape triangles (diagonal 00-11) against the caller-supplied angle; CharacterMovement is not consulted. No package or transaction changes.");
     return R;
 }
 }

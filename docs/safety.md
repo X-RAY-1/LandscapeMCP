@@ -23,16 +23,18 @@ Radiusは(0,5000]cm、Sculpt Strengthは[0,1000]cm、Smooth／Flatten Strength�
 
 `FLandscapeEditDataInterface`の通常read pathがTextureをModifyするため、元mipをコピーして読みます。GetHeight／Dry-runはTransactionを開始せず、Package dirtyやUndo履歴を変更しません。Dry-runでも対象Validationと変更計画を省略しません。
 
-## 読み取り専用の評価Tool（v0.2）
+## 読み取り専用の評価Tool（v0.2・v0.3）
 
-`GetSlope`、`GetHeightRegion`、`EvaluateWalkability`は、`GetHeight`と同じ対象解決・同じValidation・同じ元mipコピー経路を使います。Transaction、`Modify`、Package dirty化、Undo履歴の変更、保存を行いません。`bDryRun`引数はありません。
+`GetSlope`、`GetHeightRegion`、`EvaluateWalkability`、`AnalyzeSlopeNeighborhood`、`EvaluateWalkabilityRegion`は、`GetHeight`と同じ対象解決・同じValidation・同じ元mipコピー経路を使います。Transaction、`Modify`、Package dirty化、Undo履歴の変更、保存を行いません。`bDryRun`引数はありません。
 
 - 対象条件はv0.1から緩めていません。PIE／Save／GC中、World Partition、Streaming Proxy、複雑なEdit Layerなどは同じ理由で拒否します。
 - `sampleDistanceCm`と`sampleSpacingCm`はfiniteかつ[1,5000]cm。`walkableFloorAngleDeg`はfiniteかつ[0,90]。
-- `GetHeightRegion`は逆転した範囲（min > max）を拒否し、1回あたり1024 Sampleまで。
-- Landscape端ではclipしません。傾斜の計測点が1つでも範囲外、または矩形が少しでも範囲外ならFAILします。
+- `radiusCm`はfiniteかつ(0,5000]。
+- `GetHeightRegion`と`EvaluateWalkabilityRegion`は逆転した範囲（min > max）を拒否する。
+- `GetHeightRegion`は1回あたり1024 Sampleまで。`AnalyzeSlopeNeighborhood`と`EvaluateWalkabilityRegion`は1回あたり16384頂点まで。
+- Landscape端ではclipしません。傾斜の計測点が1つでも範囲外、または矩形が少しでも範囲外ならFAILします。例外は`AnalyzeSlopeNeighborhood`の半径だけで、端の外には地形がないため評価範囲から外し、`bClipped`で知らせます。
 - 結果がfiniteでない場合はFAILします。
-- `EvaluateWalkability`はCharacter、Blueprint、CharacterMovementComponentを参照も変更もしません。
+- `EvaluateWalkability`と`EvaluateWalkabilityRegion`はCharacter、Blueprint、CharacterMovementComponentを参照も変更もしません。
 
 ## Transaction・Undo・Rollback
 

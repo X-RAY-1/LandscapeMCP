@@ -76,6 +76,85 @@ struct LANDSCAPEMCP_API FLandscapeMCPHeightRegionResult
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector MaxSlopeLocation = FVector::ZeroVector;
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") TArray<double> HeightsCm;
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightQuantizationCm = 0;
+    /** v0.3: 矩形に重なるLandscapeの実三角形(対角線00-11で分割)の最大傾斜。SampleSpacingCmに依存しない。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bTriangleSlopeValid = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MaxTriangleSlopeDegrees = 0;
+    /** 最大傾斜の三角形の重心。Zは3頂点の平均高度。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector MaxTriangleSlopeLocation = FVector::ZeroVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 TriangleCount = 0;
+};
+
+/** AnalyzeSlopeNeighborhoodの結果。中心傾斜(GetSlopeと同じ中心差分)と、周囲の実三角形から求めた局所傾斜を並べて返す。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPSlopeNeighborhoodResult
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bSuccess = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString LandscapePath;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Message;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WorldX = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WorldY = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double RadiusCm = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SampleDistanceCm = 0;
+    /** GetSlopeと同じ定義の代表傾斜。頂点・尾根・谷底・鞍部では周囲が急でも0になり得る。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double CenterSlopeDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double CenterSlopeDirectionDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bCenterDirectionValid = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double CenterSlopeUncertaintyDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightCenterCm = 0;
+    /** 重心が半径内にある実三角形(中心を含むセルの2枚は常に含む)の最大傾斜。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double LocalMaxSlopeDegrees = 0;
+    /** 同じ三角形群の平均傾斜。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double LocalMeanSlopeDegrees = 0;
+    /** 最大傾斜の三角形の重心。Zは3頂点の平均高度。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector MaxSlopeLocation = FVector::ZeroVector;
+    /** 最大傾斜の三角形の最大上昇方向。bMaxSlopeDirectionValidがfalseなら0で意味を持たない。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MaxSlopeDirectionDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bMaxSlopeDirectionValid = false;
+    /** 最大傾斜の三角形について、高さ量子化が傾斜角へ与え得る誤差の上限。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double LocalMaxSlopeUncertaintyDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 TriangleCount = 0;
+    /** 読み取ったHeightfield頂点数。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 SampleCount = 0;
+    /** 半径がLandscape端を越え、評価範囲が端で切られた場合true。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bClipped = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightQuantizationCm = 0;
+};
+
+/** EvaluateWalkabilityRegionの結果。矩形に重なる実三角形ごとにWalkableFloorAngleDegと比較した集計。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPWalkabilityRegionResult
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bSuccess = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString LandscapePath;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Message;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WalkableFloorAngleDeg = 0;
+    /** 読み取ったHeightfield頂点数。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 SampleCount = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 TriangleCount = 0;
+    /** 三角形ごとの分類数。合計はTriangleCount。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 WalkableCount = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 NearLimitCount = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 UnwalkableCount = 0;
+    /** WalkableCount / TriangleCount。NEAR_LIMITは含めない。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WalkableRatio = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MaxSlopeDegrees = 0;
+    /** WalkableFloorAngleDeg - MaxSlopeDegrees。負なら超過。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WorstMarginDegrees = 0;
+    /** 最大傾斜の三角形の重心。Zは3頂点の平均高度。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector WorstLocation = FVector::ZeroVector;
+    /** 最大傾斜の三角形の最大上昇方向。bWorstSlopeDirectionValidがfalseなら0で意味を持たない。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WorstSlopeDirectionDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bWorstSlopeDirectionValid = false;
+    /** 最大傾斜の三角形について、高さ量子化が傾斜角へ与え得る誤差の上限。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SlopeUncertaintyDegrees = 0;
+    /** WALKABLE(全三角形がWALKABLE) / UNWALKABLE(全三角形がUNWALKABLE) / MIXED(それ以外。NEAR_LIMITを含む場合もMIXED)。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Classification;
+    /** 評価した三角形群のXY範囲(セル単位へ広げた範囲)と高度範囲。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector WorldMin = FVector::ZeroVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector WorldMax = FVector::ZeroVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightQuantizationCm = 0;
 };
 
 /** EvaluateWalkabilityの結果。Landscape形状だけの評価で、CharacterMovementの設定や挙動は参照しない。 */
@@ -103,13 +182,13 @@ struct LANDSCAPEMCP_API FLandscapeMCPWalkabilityResult
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightCenterCm = 0;
 };
 
-/** v0.2: Editor限定。World Partition非使用で、表示・ロック解除済みの標準Edit Layerが1つあるLandscapeのみ対応。保存しない。 */
+/** v0.3: Editor限定。World Partition非使用で、表示・ロック解除済みの標準Edit Layerが1つあるLandscapeのみ対応。保存しない。 */
 UCLASS()
 class LANDSCAPEMCP_API ULandscapeMCPToolset : public UToolsetDefinition
 {
     GENERATED_BODY()
 public:
-    virtual FString GetToolsetVersion() const override { return TEXT("0.2"); }
+    virtual FString GetToolsetVersion() const override { return TEXT("0.3"); }
 
     /** 明示指定された読み込み済みEditor LevelにLandscapeを作成する。LocationはXY最小隅。
      * Scaleはグリッド座標単位あたりのcm。推奨値は(100,100,100)。InitialWorldHeightは絶対ワールドZのcm。
@@ -168,4 +247,21 @@ public:
     UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
     static FLandscapeMCPWalkabilityResult EvaluateWalkability(const FString& LandscapePath, double WorldX, double WorldY,
         double WalkableFloorAngleDeg, double SampleDistanceCm);
+
+    /** 指定位置の中心傾斜と、周囲のLandscape実三角形から求めた局所傾斜を取得する。読み取り専用。
+     * CenterSlopeDegreesはGetSlopeと同じ中心差分(SampleDistanceCmは[1,5000])。頂点・尾根・谷底・鞍部では0になり得る。
+     * LocalMaxSlopeDegrees / LocalMeanSlopeDegreesは、重心がRadiusCm((0,5000])以内にある実三角形の最大・平均傾斜。
+     * 読み取りは最大16384頂点。半径がLandscape端を越える部分は評価範囲から外れ、bClippedがtrueになる。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPSlopeNeighborhoodResult AnalyzeSlopeNeighborhood(const FString& LandscapePath, double WorldX, double WorldY,
+        double RadiusCm, double SampleDistanceCm);
+
+    /** 矩形領域に重なるLandscape実三角形を、WalkableFloorAngleDeg([0,90])に対して一括評価するgeometry評価。読み取り専用。
+     * 矩形全体がLandscape内に必要。読み取りは最大16384頂点で、超える場合は領域を分割する。
+     * CharacterやBlueprintを参照せず、CharacterMovementの完全な再現でもない。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPWalkabilityRegionResult EvaluateWalkabilityRegion(const FString& LandscapePath, double MinX, double MinY,
+        double MaxX, double MaxY, double WalkableFloorAngleDeg);
 };

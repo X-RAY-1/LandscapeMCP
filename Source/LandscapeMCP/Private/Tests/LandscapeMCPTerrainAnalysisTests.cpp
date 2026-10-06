@@ -433,7 +433,8 @@ bool FLandscapeMCPTerrainAnalysisTest::RunTest(const FString& Parameters)
     for (const TCHAR* Tool : { TEXT("CreateLandscape"),TEXT("GetHeight"),TEXT("SculptRegion"),TEXT("SmoothRegion"),TEXT("FlattenRegion"),
         TEXT("GetSlope"),TEXT("GetHeightRegion"),TEXT("EvaluateWalkability") })
     { TestTrue(*FString::Printf(TEXT("official schema includes %s"),Tool),Schema.Contains(Tool)); }
-    TestEqual(TEXT("toolset version"),GetDefault<ULandscapeMCPToolset>()->GetToolsetVersion(),FString(TEXT("0.2")));
+    // Versionの完全一致は最新のsuite(V03)で確認する。ここではv0.2以降であることだけを見る。
+    TestTrue(TEXT("toolset version is 0.2 or later"),FCString::Atod(*GetDefault<ULandscapeMCPToolset>()->GetToolsetVersion()) >= 0.2 - 1.e-9);
     AddInfo(Schema);
     return true;
 }

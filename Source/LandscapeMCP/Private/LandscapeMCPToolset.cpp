@@ -69,3 +69,15 @@ FLandscapeMCPWalkabilityResult ULandscapeMCPToolset::EvaluateWalkability(const F
 {
     return Publish(LandscapeMCP::Walkability(LandscapePath, WorldX, WorldY, WalkableFloorAngleDeg, SampleDistanceCm));
 }
+
+FLandscapeMCPSlopeNeighborhoodResult ULandscapeMCPToolset::AnalyzeSlopeNeighborhood(const FString& LandscapePath, double WorldX, double WorldY,
+    double RadiusCm, double SampleDistanceCm)
+{
+    return Publish(LandscapeMCP::SlopeNeighborhood(LandscapePath, WorldX, WorldY, RadiusCm, SampleDistanceCm));
+}
+
+FLandscapeMCPWalkabilityRegionResult ULandscapeMCPToolset::EvaluateWalkabilityRegion(const FString& LandscapePath, double MinX, double MinY,
+    double MaxX, double MaxY, double WalkableFloorAngleDeg)
+{
+    return Publish(LandscapeMCP::WalkabilityRegion(LandscapePath, MinX, MinY, MaxX, MaxY, WalkableFloorAngleDeg));
+}

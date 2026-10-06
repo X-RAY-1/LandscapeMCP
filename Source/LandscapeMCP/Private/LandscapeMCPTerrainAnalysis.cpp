@@ -31,15 +31,20 @@ FSlope SlopeFromHeights(double HeightXMinus, double HeightXPlus, double HeightYM
     return SlopeFromGradient((HeightXPlus-HeightXMinus)/(2.0*DistanceCm), (HeightYPlus-HeightYMinus)/(2.0*DistanceCm));
 }
 
-double SlopeUncertaintyDegrees(const FSlope& Slope, double QuantizationCm, double DistanceCm)
+double SlopeUncertaintyFromGradientError(double GradientMagnitude, double GradientError)
 {
     // 一次近似 e/(1+g^2) は有限な誤差に対する上限にならないため、atanの差を両側で直接評価する。
+    const double Angle = FMath::Atan(GradientMagnitude);
+    const double Upper = FMath::Atan(GradientMagnitude+GradientError) - Angle;
+    const double Lower = Angle - FMath::Atan(FMath::Max(0.0, GradientMagnitude-GradientError));
+    return FMath::RadiansToDegrees(FMath::Max(Upper, Lower));
+}
+
+double SlopeUncertaintyDegrees(const FSlope& Slope, double QuantizationCm, double DistanceCm)
+{
     const double GradientError = UE_DOUBLE_SQRT_2 * QuantizationCm / (2.0*DistanceCm);
     const double Magnitude = FMath::Sqrt(Slope.GradientX*Slope.GradientX + Slope.GradientY*Slope.GradientY);
-    const double Angle = FMath::Atan(Magnitude);
-    const double Upper = FMath::Atan(Magnitude+GradientError) - Angle;
-    const double Lower = Angle - FMath::Atan(FMath::Max(0.0, Magnitude-GradientError));
-    return FMath::RadiansToDegrees(FMath::Max(Upper, Lower));
+    return SlopeUncertaintyFromGradientError(Magnitude, GradientError);
 }
 
 FWalkability EvaluateWalkability(double SlopeDegrees, double WalkableFloorAngleDeg, double UncertaintyDegrees)
@@ -88,5 +93,83 @@ FRegionStats ComputeRegionStats(TConstArrayView<double> Heights, int32 CountX, i
         }
     }
     return S;
+}
+
+FCellTriangles CellTriangleSlopes(double H00, double H10, double H01, double H11, double SpacingX, double SpacingY)
+{
+    FCellTriangles T;
+    // Lower=(00,10,11): X方向は辺00-10、Y方向は辺10-11。
+    T.Lower = SlopeFromGradient((H10-H00)/SpacingX, (H11-H10)/SpacingY);
+    // Upper=(00,01,11): X方向は辺01-11、Y方向は辺00-01。
+    T.Upper = SlopeFromGradient((H11-H01)/SpacingX, (H01-H00)/SpacingY);
+    return T;
+}
+
+FVector2D TriangleCentroid(int32 CellX, int32 CellY, bool bUpper)
+{
+    return bUpper ? FVector2D(CellX + 1.0/3.0, CellY + 2.0/3.0) : FVector2D(CellX + 2.0/3.0, CellY + 1.0/3.0);
+}
+
+double TriangleGradientError(double QuantizationCm, double SpacingX, double SpacingY)
+{
+    const double EX = QuantizationCm/SpacingX, EY = QuantizationCm/SpacingY;
+    return FMath::Sqrt(EX*EX + EY*EY);
+}
+
+FTriangleStats ComputeTriangleStats(TConstArrayView<double> Heights, int32 CountX, int32 CountY, double SpacingX, double SpacingY,
+    double WalkableFloorAngleDeg, double QuantizationCm, TFunctionRef<bool(int32, int32, bool)> Include)
+{
+    FTriangleStats S;
+    if (CountX < 2 || CountY < 2 || Heights.Num() != CountX*CountY || !(SpacingX > 0) || !(SpacingY > 0)) { return S; }
+    const double GradientError = TriangleGradientError(QuantizationCm, SpacingX, SpacingY);
+    double Sum = 0;
+    for (int32 Y = 0; Y+1 < CountY; ++Y)
+    {
+        for (int32 X = 0; X+1 < CountX; ++X)
+        {
+            const FCellTriangles Cell = CellTriangleSlopes(Heights[Y*CountX+X], Heights[Y*CountX+X+1],
+                Heights[(Y+1)*CountX+X], Heights[(Y+1)*CountX+X+1], SpacingX, SpacingY);
+            for (int32 Index = 0; Index < 2; ++Index)
+            {
+                const bool bUpper = Index == 1;
+                if (!Include(X, Y, bUpper)) { continue; }
+                const FSlope& Slope = bUpper ? Cell.Upper : Cell.Lower;
+                const double Magnitude = FMath::Sqrt(Slope.GradientX*Slope.GradientX + Slope.GradientY*Slope.GradientY);
+                const double Uncertainty = SlopeUncertaintyFromGradientError(Magnitude, GradientError);
+                switch (EvaluateWalkability(Slope.SlopeDegrees, WalkableFloorAngleDeg, Uncertainty).Classification)
+                {
+                case EWalkability::Walkable: ++S.WalkableCount; break;
+                case EWalkability::NearLimit: ++S.NearLimitCount; break;
+                default: ++S.UnwalkableCount; break;
+                }
+                Sum += Slope.SlopeDegrees;
+                if (S.TriangleCount == 0 || Slope.SlopeDegrees > S.MaxSlopeDegrees)
+                {
+                    S.MaxSlopeDegrees = Slope.SlopeDegrees; S.MaxSlope = Slope; S.MaxSlopeUncertaintyDegrees = Uncertainty;
+                    S.MaxCellX = X; S.MaxCellY = Y; S.bMaxIsUpper = bUpper;
+                }
+                ++S.TriangleCount;
+            }
+        }
+    }
+    if (S.TriangleCount > 0) { S.MeanSlopeDegrees = Sum / S.TriangleCount; }
+    return S;
+}
+
+ERegionWalkability ClassifyRegion(const FTriangleStats& Stats)
+{
+    if (Stats.TriangleCount > 0 && Stats.WalkableCount == Stats.TriangleCount) { return ERegionWalkability::Walkable; }
+    if (Stats.TriangleCount > 0 && Stats.UnwalkableCount == Stats.TriangleCount) { return ERegionWalkability::Unwalkable; }
+    return ERegionWalkability::Mixed;
+}
+
+const TCHAR* ToString(ERegionWalkability Classification)
+{
+    switch (Classification)
+    {
+    case ERegionWalkability::Walkable: return TEXT("WALKABLE");
+    case ERegionWalkability::Unwalkable: return TEXT("UNWALKABLE");
+    default: return TEXT("MIXED");
+    }
 }
 }
