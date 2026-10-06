@@ -1,4 +1,5 @@
 #include "LandscapeMCPOperations.h"
+#include "LandscapeMCPTerrainAnalysis.h"
 #include "Editor.h"
 #include "Engine/Level.h"
 #include "Engine/Texture2D.h"
@@ -384,5 +385,149 @@ FLandscapeMCPResult Edit(const FEditRequest& R)
     }
     Result.Message = TEXT("Source heightfield verified after edit; layer/collision update requested; Undo available; nothing saved.");
     return Result;
+}
+
+namespace
+{
+    constexpr double MinSampleDistance = 1.0;
+    constexpr double MaxSampleDistance = 5000.0;
+    constexpr int32 MaxRegionSamples = 1024;
+
+    // Heightと同じbilinear補間。解決済みの対象とReaderを共有し、複数点を1回のValidationで読む。
+    bool SampleHeight(const FTarget& T, FSourceReader& Reader, double X, double Y, double& OutZ, bool& bOutside, FString& Error)
+    {
+        const FVector2D Local((X-T.Origin.X)/T.Scale.X,(Y-T.Origin.Y)/T.Scale.Y);
+        bOutside = !Contains(T.Extent,Local);
+        if (bOutside) { Error = TEXT("Sample point is outside Landscape."); return false; }
+        const int32 X0 = FMath::FloorToInt(Local.X), Y0 = FMath::FloorToInt(Local.Y);
+        const int32 X1 = FMath::Min(X0+1,T.Extent.Max.X), Y1 = FMath::Min(Y0+1,T.Extent.Max.Y);
+        uint16 H00,H10,H01,H11;
+        if (!Reader.Read(X0,Y0,H00,Error) || !Reader.Read(X1,Y0,H10,Error)
+            || !Reader.Read(X0,Y1,H01,Error) || !Reader.Read(X1,Y1,H11,Error)) { return false; }
+        OutZ = WorldHeight(T,FMath::Lerp(FMath::Lerp(double(H00),double(H10),Local.X-X0),
+            FMath::Lerp(double(H01),double(H11),Local.X-X0),Local.Y-Y0));
+        return true;
+    }
+    struct FSlopeMeasurement
+    {
+        Analysis::FSlope Slope;
+        double HeightCenterCm = 0;
+        double QuantizationCm = 0;
+        double UncertaintyDegrees = 0;
+    };
+    // GetSlopeとEvaluateWalkabilityが同じ定義を使うための共通経路。
+    bool MeasureSlope(const FString& Path, double X, double Y, double D, FSlopeMeasurement& Out, FString& Error)
+    {
+        if (!Coordinate(X) || !Coordinate(Y)) { Error = TEXT("Non-finite / out-of-range world XY."); return false; }
+        if (!FMath::IsFinite(D) || D < MinSampleDistance || D > MaxSampleDistance)
+        { Error = TEXT("SampleDistanceCm must be finite and within [1,5000]."); return false; }
+        FTarget T;
+        if (!Resolve(Path,T,Error)) { return false; }
+        FSourceReader Reader(T); bool bOutside = false;
+        if (!SampleHeight(T,Reader,X,Y,Out.HeightCenterCm,bOutside,Error))
+        { if (bOutside) { Error = TEXT("Query point is outside Landscape."); } return false; }
+        double XMinus = 0, XPlus = 0, YMinus = 0, YPlus = 0;
+        // 端で片側差分へ切り替えると定義が変わるため、4点が揃わない場合は計測しない。
+        if (!SampleHeight(T,Reader,X-D,Y,XMinus,bOutside,Error) || !SampleHeight(T,Reader,X+D,Y,XPlus,bOutside,Error)
+            || !SampleHeight(T,Reader,X,Y-D,YMinus,bOutside,Error) || !SampleHeight(T,Reader,X,Y+D,YPlus,bOutside,Error))
+        {
+            if (bOutside) { Error = TEXT("Slope stencil reaches outside Landscape; move the point inward or reduce SampleDistanceCm."); }
+            return false;
+        }
+        Out.Slope = Analysis::SlopeFromHeights(XMinus,XPlus,YMinus,YPlus,D);
+        Out.QuantizationCm = T.Scale.Z/128;
+        Out.UncertaintyDegrees = Analysis::SlopeUncertaintyDegrees(Out.Slope,Out.QuantizationCm,D);
+        if (!FMath::IsFinite(Out.Slope.SlopeDegrees) || !FMath::IsFinite(Out.Slope.DirectionDegrees))
+        { Error = TEXT("Slope evaluation produced a non-finite value."); return false; }
+        return true;
+    }
+}
+
+FLandscapeMCPSlopeResult Slope(const FString& Path, double X, double Y, double SampleDistanceCm)
+{
+    FLandscapeMCPSlopeResult R; R.LandscapePath = Path; R.WorldX = X; R.WorldY = Y; R.SampleDistanceCm = SampleDistanceCm;
+    FSlopeMeasurement M; FString Error;
+    if (!MeasureSlope(Path,X,Y,SampleDistanceCm,M,Error)) { R.Message = Error; return R; }
+    R.bSuccess = true;
+    R.SlopeDegrees = M.Slope.SlopeDegrees; R.SlopeDirectionDegrees = M.Slope.DirectionDegrees;
+    R.bDirectionValid = M.Slope.bDirectionValid; R.Normal = M.Slope.Normal;
+    R.HeightCenterCm = M.HeightCenterCm; R.HeightQuantizationCm = M.QuantizationCm;
+    R.SlopeUncertaintyDegrees = M.UncertaintyDegrees;
+    R.Message = TEXT("Read-only central-difference slope of the bilinear source heightfield (not a collision normal). No package or transaction changes.");
+    return R;
+}
+
+FLandscapeMCPWalkabilityResult Walkability(const FString& Path, double X, double Y, double WalkableFloorAngleDeg, double SampleDistanceCm)
+{
+    FLandscapeMCPWalkabilityResult R; R.LandscapePath = Path; R.WorldX = X; R.WorldY = Y;
+    R.WalkableFloorAngleDeg = WalkableFloorAngleDeg; R.SampleDistanceCm = SampleDistanceCm;
+    if (!FMath::IsFinite(WalkableFloorAngleDeg) || WalkableFloorAngleDeg < 0 || WalkableFloorAngleDeg > 90)
+    { R.Message = TEXT("WalkableFloorAngleDeg must be finite and within [0,90]."); return R; }
+    FSlopeMeasurement M; FString Error;
+    if (!MeasureSlope(Path,X,Y,SampleDistanceCm,M,Error)) { R.Message = Error; return R; }
+    const Analysis::FWalkability W = Analysis::EvaluateWalkability(M.Slope.SlopeDegrees,WalkableFloorAngleDeg,M.UncertaintyDegrees);
+    R.bSuccess = true;
+    R.SlopeDegrees = M.Slope.SlopeDegrees; R.SlopeDirectionDegrees = M.Slope.DirectionDegrees;
+    R.bDirectionValid = M.Slope.bDirectionValid; R.HeightCenterCm = M.HeightCenterCm;
+    R.SlopeUncertaintyDegrees = M.UncertaintyDegrees;
+    R.bWalkable = W.bWalkable; R.MarginDegrees = W.MarginDegrees; R.Classification = Analysis::ToString(W.Classification);
+    R.Message = TEXT("Read-only geometry evaluation against the caller-supplied angle; CharacterMovement is not consulted. No package or transaction changes.");
+    return R;
+}
+
+FLandscapeMCPHeightRegionResult HeightRegion(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, double SpacingCm)
+{
+    FLandscapeMCPHeightRegionResult R; R.LandscapePath = Path; R.SampleSpacingCm = SpacingCm;
+    if (!Coordinate(MinX) || !Coordinate(MinY) || !Coordinate(MaxX) || !Coordinate(MaxY))
+    { R.Message = TEXT("Non-finite / out-of-range region bounds."); return R; }
+    if (MaxX < MinX || MaxY < MinY) { R.Message = TEXT("Reversed region bounds: max must be >= min."); return R; }
+    if (!FMath::IsFinite(SpacingCm) || SpacingCm < MinSampleDistance || SpacingCm > MaxSampleDistance)
+    { R.Message = TEXT("SampleSpacingCm must be finite and within [1,5000]."); return R; }
+    // 割り切れる入力が浮動小数点誤差で1サンプル減らないよう、わずかな余裕を持たせる。
+    const int64 CountX = int64(FMath::FloorToDouble((MaxX-MinX)/SpacingCm + 1.e-9)) + 1;
+    const int64 CountY = int64(FMath::FloorToDouble((MaxY-MinY)/SpacingCm + 1.e-9)) + 1;
+    if (CountX > MaxRegionSamples || CountY > MaxRegionSamples || CountX*CountY > MaxRegionSamples)
+    { R.Message = TEXT("Region exceeds 1024 samples; increase SampleSpacingCm or split the region."); return R; }
+    FTarget T; FString Error;
+    if (!Resolve(Path,T,Error)) { R.Message = Error; return R; }
+    const FVector2D LocalMin((MinX-T.Origin.X)/T.Scale.X,(MinY-T.Origin.Y)/T.Scale.Y);
+    const FVector2D LocalMax((MaxX-T.Origin.X)/T.Scale.X,(MaxY-T.Origin.Y)/T.Scale.Y);
+    if (!Contains(T.Extent,LocalMin) || !Contains(T.Extent,LocalMax))
+    { R.Message = TEXT("Region is not fully inside Landscape; it is not clipped."); return R; }
+    const int32 NX = int32(CountX), NY = int32(CountY);
+    FSourceReader Reader(T); bool bOutside = false;
+    TArray<double> Heights; Heights.Reserve(NX*NY);
+    for (int32 IY = 0; IY < NY; ++IY)
+    {
+        for (int32 IX = 0; IX < NX; ++IX)
+        {
+            // 余裕分でmaxをわずかに超えた場合も、検証済みの矩形内へ収める。
+            const double X = FMath::Min(MinX + IX*SpacingCm, MaxX), Y = FMath::Min(MinY + IY*SpacingCm, MaxY);
+            double Z = 0;
+            if (!SampleHeight(T,Reader,X,Y,Z,bOutside,Error)) { R.Message = Error; return R; }
+            Heights.Add(Z);
+        }
+    }
+    const Analysis::FRegionStats S = Analysis::ComputeRegionStats(Heights,NX,NY,SpacingCm);
+    if (S.MinIndex == INDEX_NONE || !FMath::IsFinite(S.MeanHeight)) { R.Message = TEXT("Region statistics could not be evaluated."); return R; }
+    auto Location = [&](int32 Index) { return FVector(MinX + (Index%NX)*SpacingCm, MinY + (Index/NX)*SpacingCm, Heights[Index]); };
+    R.bSuccess = true;
+    R.SampleCount = Heights.Num(); R.SampleCountX = NX; R.SampleCountY = NY;
+    R.MinHeightCm = S.MinHeight; R.MaxHeightCm = S.MaxHeight; R.MeanHeightCm = S.MeanHeight;
+    R.MinHeightLocation = Location(S.MinIndex); R.MaxHeightLocation = Location(S.MaxIndex);
+    R.WorldMin = FVector(MinX,MinY,S.MinHeight);
+    R.WorldMax = FVector(MinX + (NX-1)*SpacingCm, MinY + (NY-1)*SpacingCm, S.MaxHeight);
+    R.bSlopeValid = S.bSlopeValid;
+    if (S.bSlopeValid)
+    {
+        const int32 Base = S.MaxSlopeCellY*NX + S.MaxSlopeCellX;
+        R.MaxSlopeDegrees = S.MaxSlopeDegrees;
+        R.MaxSlopeLocation = FVector(MinX + (S.MaxSlopeCellX+0.5)*SpacingCm, MinY + (S.MaxSlopeCellY+0.5)*SpacingCm,
+            (Heights[Base]+Heights[Base+1]+Heights[Base+NX]+Heights[Base+NX+1])/4.0);
+    }
+    R.HeightQuantizationCm = T.Scale.Z/128;
+    R.HeightsCm = MoveTemp(Heights);
+    R.Message = TEXT("Read-only bilinear source heights on a regular grid (row-major, Y outer). No package or transaction changes.");
+    return R;
 }
 }

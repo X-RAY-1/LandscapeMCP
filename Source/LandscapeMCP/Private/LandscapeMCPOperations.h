@@ -22,4 +22,8 @@ namespace LandscapeMCP
         int32 CountX, int32 CountY, int32 Sections, int32 Quads, double InitialHeight, bool bDryRun);
     FLandscapeMCPResult Height(const FString& Path, double X, double Y);
     FLandscapeMCPResult Edit(const FEditRequest& Request);
+    // 以下は読み取り専用。Transaction、Modify、Package dirty化を行わない。
+    FLandscapeMCPSlopeResult Slope(const FString& Path, double X, double Y, double SampleDistanceCm);
+    FLandscapeMCPHeightRegionResult HeightRegion(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, double SpacingCm);
+    FLandscapeMCPWalkabilityResult Walkability(const FString& Path, double X, double Y, double WalkableFloorAngleDeg, double SampleDistanceCm);
 }

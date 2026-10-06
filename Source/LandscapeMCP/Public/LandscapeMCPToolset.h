@@ -24,13 +24,92 @@ struct LANDSCAPEMCP_API FLandscapeMCPResult
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bClipped = false;
 };
 
-/** v0.1: Editor限定。World Partition非使用で、表示・ロック解除済みの標準Edit Layerが1つあるLandscapeのみ対応。保存しない。 */
+/** GetSlopeの結果。角度は度、距離と高さはワールド座標のcm。読み取り専用で、PackageやUndo履歴を変更しない。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPSlopeResult
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bSuccess = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString LandscapePath;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Message;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WorldX = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WorldY = 0;
+    /** 0は水平、90は垂直。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SlopeDegrees = 0;
+    /** 最大上昇方向。+Xが0、+Yが90、範囲は[0,360)。bDirectionValidがfalseなら0で意味を持たない。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SlopeDirectionDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bDirectionValid = false;
+    /** 上向きの単位法線。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector Normal = FVector::UpVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SampleDistanceCm = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightCenterCm = 0;
+    /** 高さ量子化が傾斜角へ与え得る最大誤差。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SlopeUncertaintyDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightQuantizationCm = 0;
+};
+
+/** GetHeightRegionの結果。HeightsCmは行優先(Yが外側、Xが内側)で、要素(ix,iy)はWorldMin.XY + (ix,iy)*SampleSpacingCmの高さ。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPHeightRegionResult
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bSuccess = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString LandscapePath;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Message;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 SampleCount = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 SampleCountX = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 SampleCountY = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SampleSpacingCm = 0;
+    /** 実際にサンプルした格子の最小隅と最小高度。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector WorldMin = FVector::ZeroVector;
+    /** 実際にサンプルした格子の最大隅と最大高度。間隔が割り切れない場合は要求したmaxより内側になる。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector WorldMax = FVector::ZeroVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MinHeightCm = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MaxHeightCm = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MeanHeightCm = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector MinHeightLocation = FVector::ZeroVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector MaxHeightLocation = FVector::ZeroVector;
+    /** 隣接サンプル4点で作るセルごとの傾斜の最大値。各軸2サンプル未満ならbSlopeValidがfalse。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bSlopeValid = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MaxSlopeDegrees = 0;
+    /** 最大傾斜セルの中心。Zは4隅の平均高度。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector MaxSlopeLocation = FVector::ZeroVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") TArray<double> HeightsCm;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightQuantizationCm = 0;
+};
+
+/** EvaluateWalkabilityの結果。Landscape形状だけの評価で、CharacterMovementの設定や挙動は参照しない。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPWalkabilityResult
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bSuccess = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString LandscapePath;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Message;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WorldX = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WorldY = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SlopeDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SlopeDirectionDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bDirectionValid = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double WalkableFloorAngleDeg = 0;
+    /** SlopeDegrees <= WalkableFloorAngleDeg。境界値は歩行可能側。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bWalkable = false;
+    /** WalkableFloorAngleDeg - SlopeDegrees。負なら超過。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MarginDegrees = 0;
+    /** WALKABLE / NEAR_LIMIT / UNWALKABLE。NEAR_LIMITは|MarginDegrees| <= SlopeUncertaintyDegrees。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Classification;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SlopeUncertaintyDegrees = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double SampleDistanceCm = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightCenterCm = 0;
+};
+
+/** v0.2: Editor限定。World Partition非使用で、表示・ロック解除済みの標準Edit Layerが1つあるLandscapeのみ対応。保存しない。 */
 UCLASS()
 class LANDSCAPEMCP_API ULandscapeMCPToolset : public UToolsetDefinition
 {
     GENERATED_BODY()
 public:
-    virtual FString GetToolsetVersion() const override { return TEXT("0.1"); }
+    virtual FString GetToolsetVersion() const override { return TEXT("0.2"); }
 
     /** 明示指定された読み込み済みEditor LevelにLandscapeを作成する。LocationはXY最小隅。
      * Scaleはグリッド座標単位あたりのcm。推奨値は(100,100,100)。InitialWorldHeightは絶対ワールドZのcm。
@@ -66,4 +145,27 @@ public:
     UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
     static FLandscapeMCPResult FlattenRegion(const FString& LandscapePath, FVector2D Center,
         double RadiusCm, double TargetHeightCm, double Strength, double Falloff, bool bDryRun = true);
+
+    /** 指定World XYの傾斜を、元Heightfieldのbilinear高度の中心差分から取得する。読み取り専用。
+     * SampleDistanceCmは中心から+-X/+-Yへ離す距離で[1,5000]。4点すべてがLandscape内に必要で、端ではclipせずFAILする。
+     * SlopeDegreesは0が水平、90が垂直。SlopeDirectionDegreesは最大上昇方向(+Xが0、+Yが90)。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPSlopeResult GetSlope(const FString& LandscapePath, double WorldX, double WorldY, double SampleDistanceCm);
+
+    /** 矩形領域の高度をSampleSpacingCm間隔の格子でまとめて取得し、最小・最大・平均と最大傾斜セルを返す。読み取り専用。
+     * 矩形全体がLandscape内に必要。SampleSpacingCmは[1,5000]、Sample数は最大1024。超える場合は間隔を広げるか領域を分割する。
+     * min > maxの逆転、NaN/Infinity、範囲外はFAILする。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPHeightRegionResult GetHeightRegion(const FString& LandscapePath, double MinX, double MinY,
+        double MaxX, double MaxY, double SampleSpacingCm);
+
+    /** 指定World XYの傾斜をWalkableFloorAngleDegと比較するgeometry評価。読み取り専用で、CharacterやBlueprintを参照・変更しない。
+     * WalkableFloorAngleDegは[0,90]で呼び出し側が指定する。傾斜の定義と制約はGetSlopeと同じ。
+     * 歩行の成否を保証するものではなく、CharacterMovementの完全な再現でもない。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPWalkabilityResult EvaluateWalkability(const FString& LandscapePath, double WorldX, double WorldY,
+        double WalkableFloorAngleDeg, double SampleDistanceCm);
 };

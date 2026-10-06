@@ -1,6 +1,6 @@
 # Tool仕様
 
-Toolset: `LandscapeMCP.LandscapeMCPToolset`、Version: `0.1`。公式`describe_toolset`で現在のschemaを取得できます。ここではMCP側のlower camel case field名を記載します。C++引数・UPROPERTY名は元の識別子を保持しています。
+Toolset: `LandscapeMCP.LandscapeMCPToolset`、Version: `0.2`。v0.2は既存5 Toolの入力・出力schemaを変更せず、読み取り専用の`GetSlope`／`GetHeightRegion`／`EvaluateWalkability`を追加します。公式`describe_toolset`で現在のschemaを取得できます。ここではMCP側のlower camel case field名を記載します。C++引数・UPROPERTY名は元の識別子を保持しています。
 
 ## 共通
 
@@ -94,6 +94,155 @@ Sample寸法は各軸`componentCount * sectionsPerComponent * quadsPerSection + 
 
 長いルートは制限内の円を重ねて作れます。path／rectangle brushや、隣接境界の歩行可能性保証はありません。
 
+## 地形評価Tool（v0.2）の共通事項
+
+`GetSlope`、`GetHeightRegion`、`EvaluateWalkability`は読み取り専用です。`bDryRun`引数はなく、Heightfield・Package・Undo履歴を変更しません。対象条件とPIE／Save／GC中の拒否は`GetHeight`と同じです。
+
+3 Toolはそれぞれ専用の結果を返します。上の共通結果（`FLandscapeMCPResult`）とは別の構造で、既存5 Toolの出力は変わりません。角度は度、距離と高さはワールドcmです。
+
+高さは`GetHeight`と同じく、単一標準Edit Layerの元Heightfieldをbilinear補間した値です。Collisionの面や法線ではありません。
+
+## GetSlope
+
+| 入力 | 型 / 制約 |
+|---|---|
+| `landscapePath` | string、読み込み済みActorの完全Object Path |
+| `worldX` / `worldY` | number、Landscape内のWorld XY |
+| `sampleDistanceCm` | number、[1,5000]。中心から±X／±Yへ離す距離 |
+
+中心から`sampleDistanceCm`離れた4点（±X、±Y）の高さを読み、中心差分で2D勾配を求めます。
+
+```
+gx = (h(x+d, y) - h(x-d, y)) / (2d)
+gy = (h(x, y+d) - h(x, y-d)) / (2d)
+slopeDegrees          = atan(sqrt(gx² + gy²))
+slopeDirectionDegrees = atan2(gy, gx)        （[0,360)へ正規化）
+normal                = normalize(-gx, -gy, 1)
+```
+
+位置と高さはどちらもワールドcmなので、LandscapeのScale（X／Y／Zが異なる場合を含む）は勾配へそのまま反映されます。
+
+| 出力 | 型 | 意味 |
+|---|---|---|
+| `bSuccess` | boolean | 成功判定 |
+| `landscapePath` | string | 対象の完全Path |
+| `message` | string | 結果の説明 |
+| `worldX` / `worldY` | number | 入力位置 |
+| `slopeDegrees` | number | 傾斜角。0は水平、90は垂直 |
+| `slopeDirectionDegrees` | number | 最大上昇方向。+Xが0、+Yが90、[0,360) |
+| `bDirectionValid` | boolean | 勾配がほぼ0（水平）の場合false。その場合`slopeDirectionDegrees`は0で意味を持たない |
+| `normal` | `{x,y,z}` | 上向きの単位法線 |
+| `sampleDistanceCm` | number | 入力値 |
+| `heightCenterCm` | number | 中心の高さ。`GetHeight`と同じ値 |
+| `slopeUncertaintyDegrees` | number | 高さ量子化が傾斜角へ与え得る最大誤差 |
+| `heightQuantizationCm` | number | 高度量子化刻み、Scale.Z / 128 |
+
+`sampleDistanceCm`の目安はLandscapeの格子間隔（Scale.X／Scale.Y）以上です。小さくすると局所的な面の傾き、大きくすると広い範囲の平均的な傾きになります。Characterの足元を見るならCapsule半径〜格子間隔程度を使ってください。
+
+4点のうち1つでもLandscape外ならFAILします。端で片側差分へ切り替えると傾斜の定義が変わるためです。縁から`sampleDistanceCm`未満の位置は計測できません。
+
+`slopeUncertaintyDegrees`は、高さ量子化による傾斜角誤差の保守的な上限です。各高さの量子化誤差は`heightQuantizationCm / 2`以下なので、軸ごとの勾配誤差は`q / (2d)`以下、2軸合成で√2倍になります。勾配の大きさ`g`は`[max(0, g - e), g + e]`に収まり、`atan`は単調なので、両側の角度差の大きい方が上限です。
+
+```
+e = sqrt(2) * heightQuantizationCm / (2 * sampleDistanceCm)
+g = hypot(gx, gy)
+upper = atan(g + e) - atan(g)
+lower = atan(g) - atan(max(0, g - e))
+slopeUncertaintyDegrees = degrees(max(upper, lower))
+```
+
+一次近似`e / (1 + g²)`は使いません。`e`が`g`に対して小さくない場合（Scale.Zが大きい、`sampleDistanceCm`が小さい）に上限とならず、量子化だけで判定が反転し得る範囲を`NEAR_LIMIT`から漏らすためです。
+
+```json
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_TestLandscape","worldX":2700,"worldY":3150,"sampleDistanceCm":100}
+```
+
+## GetHeightRegion
+
+| 入力 | 型 / 制約 |
+|---|---|
+| `landscapePath` | string、読み込み済みActorの完全Object Path |
+| `minX` / `minY` / `maxX` / `maxY` | number、World XYの矩形。`max >= min`。矩形全体がLandscape内 |
+| `sampleSpacingCm` | number、[1,5000]。格子の間隔 |
+
+`(minX, minY)`から`sampleSpacingCm`間隔で、`max`を超えない範囲をサンプルします。各軸のSample数は`floor((max - min) / sampleSpacingCm) + 1`です。間隔が割り切れない場合、最後のサンプルは`max`の内側になります（`worldMax`が実際の位置）。`min == max`の軸は1 Sampleで、線や1点の取得に使えます。
+
+1回あたり最大**1024 Sample**（例: 32×32）。超える場合はFAILするので、間隔を広げるか領域を分割してください。上限はAI Agentが1回の応答として扱える大きさに合わせています。
+
+| 出力 | 型 | 意味 |
+|---|---|---|
+| `bSuccess` | boolean | 成功判定 |
+| `landscapePath` | string | 対象の完全Path |
+| `message` | string | 結果の説明 |
+| `sampleCount` | integer | 総Sample数。`sampleCountX * sampleCountY` |
+| `sampleCountX` / `sampleCountY` | integer | 各軸のSample数 |
+| `sampleSpacingCm` | number | 入力値 |
+| `worldMin` / `worldMax` | `{x,y,z}` | 実際にサンプルした格子のXY範囲と、最小／最大高度 |
+| `minHeightCm` / `maxHeightCm` / `meanHeightCm` | number | 全Sampleの最小・最大・平均高度 |
+| `minHeightLocation` / `maxHeightLocation` | `{x,y,z}` | 最小／最大高度のSample位置 |
+| `bSlopeValid` | boolean | 各軸2 Sample以上あり、セル傾斜を評価できたか |
+| `maxSlopeDegrees` | number | 隣接4 Sampleで作るセルごとの傾斜の最大値 |
+| `maxSlopeLocation` | `{x,y,z}` | 最大傾斜セルの中心。Zは4隅の平均高度 |
+| `heightsCm` | number[] | 全Sampleの高度。行優先（Yが外側、Xが内側） |
+| `heightQuantizationCm` | number | 高度量子化刻み、Scale.Z / 128 |
+
+`heightsCm`の要素`ix + iy * sampleCountX`は、位置`(worldMin.x + ix * sampleSpacingCm, worldMin.y + iy * sampleSpacingCm)`の高さです。
+
+`maxSlopeDegrees`は領域内で急な場所を探すための集計値です。指定間隔のセル単位なので、見つかった位置は`GetSlope`や`EvaluateWalkability`で改めて評価してください。
+
+```json
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_TestLandscape","minX":2000,"minY":2000,"maxX":4000,"maxY":4000,"sampleSpacingCm":100}
+```
+
+この例は21×21 = 441 Sampleです。
+
+## EvaluateWalkability
+
+| 入力 | 型 / 制約 |
+|---|---|
+| `landscapePath` | string、読み込み済みActorの完全Object Path |
+| `worldX` / `worldY` | number、Landscape内のWorld XY |
+| `walkableFloorAngleDeg` | number、[0,90]。呼び出し側が指定する歩行可能角 |
+| `sampleDistanceCm` | number、[1,5000]。`GetSlope`と同じ意味 |
+
+`GetSlope`と同じ方法で傾斜を測り、`walkableFloorAngleDeg`と比較します。**Landscape形状の評価であり、CharacterMovementを参照・変更しません。** 特定のCharacter Blueprintから角度を読むこともありません。対象CharacterのWalkable Floor Angleは呼び出し側が調べて渡してください。
+
+| 出力 | 型 | 意味 |
+|---|---|---|
+| `bSuccess` | boolean | 評価できたか（歩行可能かどうかではない） |
+| `landscapePath` | string | 対象の完全Path |
+| `message` | string | 結果の説明 |
+| `worldX` / `worldY` | number | 入力位置 |
+| `slopeDegrees` | number | 傾斜角。`GetSlope`と同じ値 |
+| `slopeDirectionDegrees` / `bDirectionValid` | number / boolean | 最大上昇方向。`GetSlope`と同じ |
+| `walkableFloorAngleDeg` | number | 入力値 |
+| `bWalkable` | boolean | `slopeDegrees <= walkableFloorAngleDeg` |
+| `marginDegrees` | number | `walkableFloorAngleDeg - slopeDegrees`。負なら超過 |
+| `classification` | string | `WALKABLE` / `NEAR_LIMIT` / `UNWALKABLE` |
+| `slopeUncertaintyDegrees` | number | `NEAR_LIMIT`の判定に使う幅。`GetSlope`と同じ値 |
+| `sampleDistanceCm` | number | 入力値 |
+| `heightCenterCm` | number | 中心の高さ |
+
+`bWalkable`は境界値を歩行可能側に含めます。CharacterMovementが床法線のZ成分を「閾値以上なら歩行可能」と判定するのに合わせています。
+
+`classification`は次の規則です。
+
+| 条件 | classification |
+|---|---|
+| `marginDegrees > slopeUncertaintyDegrees` | `WALKABLE` |
+| `abs(marginDegrees) <= slopeUncertaintyDegrees` | `NEAR_LIMIT` |
+| `marginDegrees < -slopeUncertaintyDegrees` | `UNWALKABLE` |
+
+`NEAR_LIMIT`の幅は固定値ではなく、その計測の`slopeUncertaintyDegrees`です。高さは16-bitで量子化されているため、差がこの幅以内なら量子化の丸めだけで判定が反転し得ます。その範囲を「判定できない」として区別するのが目的です。Scale(100,100,100)・`sampleDistanceCm:100`の水平付近では約0.32度です。この幅はCollision三角形との差やCharacter側の要因を含みません。安全側に余裕を取る場合は、呼び出し側で`marginDegrees`にしきい値を設けてください。`NEAR_LIMIT`でも`bWalkable`は`marginDegrees >= 0`のまま返します。
+
+```json
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_TestLandscape","worldX":2700,"worldY":3150,"walkableFloorAngleDeg":44.77,"sampleDistanceCm":100}
+```
+
+約47度の斜面をWalkable Floor Angle 44.77度で評価すると、`bWalkable:false`、`marginDegrees`は約-2.2、`classification:"UNWALKABLE"`になります。
+
 ## 共通Validation
+
+地形評価Toolは、`sampleDistanceCm`／`sampleSpacingCm`が[1,5000]の範囲外、`walkableFloorAngleDeg`が[0,90]の範囲外、矩形の逆転、1024 Sample超過、計測点または矩形の範囲外をFAILとします。clipは行いません。
 
 すべてのToolは[safety](safety.md)の対象条件を満たす必要があります。座標はfiniteかつ絶対値10000000cm以下。NaN／Infinity、異常Scale、高度overflowを拒否します。ブラシ中心の範囲外はFAIL、円の縁だけの範囲外はclip。編集読み取り上限は16384 Sampleで、超えたら半径を縮める必要があります。1 Sampleも円に含まれない場合はFAILです。
