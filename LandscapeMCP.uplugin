@@ -1,0 +1,14 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1",
+  "FriendlyName": "Landscape MCP",
+  "Description": "Bounded, transactional Landscape tools for the official UE ToolsetRegistry and MCP server.",
+  "Category": "Editor",
+  "EnabledByDefault": true,
+  "CanContainContent": false,
+  "EditorOnly": true,
+  "IsExperimentalVersion": true,
+  "Modules": [{ "Name": "LandscapeMCP", "Type": "Editor", "LoadingPhase": "PostEngineInit", "TargetAllowList": ["Editor"] }],
+  "Plugins": [{ "Name": "ToolsetRegistry", "Enabled": true }]
+}

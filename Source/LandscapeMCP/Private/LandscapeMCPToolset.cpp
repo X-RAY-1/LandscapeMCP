@@ -1,0 +1,53 @@
+#include "LandscapeMCPToolset.h"
+#include "LandscapeMCPOperations.h"
+#include "Kismet/KismetSystemLibrary.h"
+
+namespace
+{
+    FLandscapeMCPResult Publish(FLandscapeMCPResult Result)
+    {
+        if (!Result.bSuccess) { UKismetSystemLibrary::RaiseScriptError(TEXT("LandscapeMCP: ") + Result.Message); }
+        return Result;
+    }
+}
+
+FLandscapeMCPResult ULandscapeMCPToolset::CreateLandscape(const FString& LevelPath, const FString& LandscapeName,
+    FVector Location, FVector Scale, int32 ComponentCountX, int32 ComponentCountY, int32 SectionsPerComponent,
+    int32 QuadsPerSection, double InitialWorldHeight, bool bDryRun)
+{
+    return Publish(LandscapeMCP::Create(LevelPath, LandscapeName, Location, Scale, ComponentCountX,
+        ComponentCountY, SectionsPerComponent, QuadsPerSection, InitialWorldHeight, bDryRun));
+}
+
+FLandscapeMCPResult ULandscapeMCPToolset::GetHeight(const FString& LandscapePath, double WorldX, double WorldY)
+{
+    return Publish(LandscapeMCP::Height(LandscapePath, WorldX, WorldY));
+}
+
+FLandscapeMCPResult ULandscapeMCPToolset::SculptRegion(const FString& LandscapePath, FVector2D Center,
+    double RadiusCm, double StrengthCm, double Falloff, bool bRaise, bool bDryRun)
+{
+    LandscapeMCP::FEditRequest R;
+    R.LandscapePath = LandscapePath; R.Center = Center; R.RadiusCm = RadiusCm;
+    R.Strength = StrengthCm; R.Falloff = Falloff; R.bRaise = bRaise; R.bDryRun = bDryRun;
+    return Publish(LandscapeMCP::Edit(R));
+}
+
+FLandscapeMCPResult ULandscapeMCPToolset::SmoothRegion(const FString& LandscapePath, FVector2D Center,
+    double RadiusCm, double Strength, double Falloff, bool bDryRun)
+{
+    LandscapeMCP::FEditRequest R;
+    R.LandscapePath = LandscapePath; R.Center = Center; R.RadiusCm = RadiusCm;
+    R.Strength = Strength; R.Falloff = Falloff; R.bDryRun = bDryRun; R.Operation = LandscapeMCP::EOperation::Smooth;
+    return Publish(LandscapeMCP::Edit(R));
+}
+
+FLandscapeMCPResult ULandscapeMCPToolset::FlattenRegion(const FString& LandscapePath, FVector2D Center,
+    double RadiusCm, double TargetHeightCm, double Strength, double Falloff, bool bDryRun)
+{
+    LandscapeMCP::FEditRequest R;
+    R.LandscapePath = LandscapePath; R.Center = Center; R.RadiusCm = RadiusCm;
+    R.Strength = Strength; R.Falloff = Falloff; R.TargetHeightCm = TargetHeightCm;
+    R.bDryRun = bDryRun; R.Operation = LandscapeMCP::EOperation::Flatten;
+    return Publish(LandscapeMCP::Edit(R));
+}

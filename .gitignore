@@ -1,0 +1,29 @@
+# Unreal生成物
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+Build/
+# IDE・ローカル設定
+.vs/
+.idea/
+.vscode/
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln
+*.sdf
+*.opensdf
+*.opendb
+*.xcodeproj/
+*.xcworkspace/
+# OS・検証の一時出力
+.DS_Store
+Thumbs.db
+*.log
+*.dmp
+*.tmp
+__pycache__/
+*.pyc
