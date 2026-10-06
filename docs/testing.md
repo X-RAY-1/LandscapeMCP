@@ -128,3 +128,72 @@ MCP簡易E2E（Claude Code）は修正版Binariesで再実行しました。空�
 | 端での計測 | FAIL（clipなし） |
 
 `NEAR_LIMIT`／`slopeUncertaintyDegrees`の名称見直しと`localMaxSlopeDegrees`はnon-blockingの指摘で、v0.3候補として[制限](limitations.md)に記載しました。
+
+## v0.3 地形評価の強化の検証（2026-10-06）
+
+対象は`feature/v0.3-terrain-analysis-hardening`。Codexレビュー前の結果です。Characterの実走行は行っていません。
+
+### 三角形分割の確認
+
+実装前に、UE5.8のLandscapeがセルをどちらの対角線で分割するかを確認しました。
+
+- Engineソース: 描画側（`LandscapeRender.cpp`）は各セルを`(i00, i11, i10)`と`(i00, i01, i11)`のindexで作り、Collision側（Chaos `HeightField.cpp`）は`Points[0],[1],[3]`と`Points[0],[3],[2]`で判定します。どちらも対角線00-11です。
+- Collision構築側にX方向を反転する処理があり、ソースだけでは断定できなかったため、稼働中のEditorで実測しました。頂点を1つずつ持ち上げて4隅が[0,100,100,0]のセルを作ると、セル中心のline traceは0cm、4隅が[100,0,0,100]のセルでは100cmでした。対角線00-11の場合に限りこの結果になります（bilinearはどちらも50cm）。
+- 同じ確認をAutomationに入れています。Engineの挙動が変わればAutomationが失敗します。
+
+### Build / Automation
+
+| 項目 | 結果 |
+|---|---|
+| Build（RunUAT BuildPlugin、Win64） | `BUILD SUCCESSFUL`、終了コード0 |
+| `LandscapeMCP.V01.SafetyAndOperations`（無変更） | Success、エラー0、警告0 |
+| `LandscapeMCP.V02.TerrainAnalysis` | Success、エラー0、警告0 |
+| `LandscapeMCP.V03.TerrainHardening`（新規） | Success、エラー0、警告0 |
+
+成功3、失敗0、Editor終了コード0。隔離Project（`ModelContextProtocol`無効）で実行しました。
+
+V02のsuiteは1行だけ変更しています。Toolset Version `0.2`の完全一致確認が、Versionを`0.3`へ上げると必ず失敗するため、「0.2以降」の確認へ変えました。それ以外のv0.2の確認は無変更で通っています。
+
+`V03.TerrainHardening`の対象:
+
+- 計算層: 4隅[0,100,100,0]のセルで4隅平均gradientが0のまま（v0.2の定義は不変）、実三角形は2枚とも約54.7度。頂点10だけ・頂点01だけを上げたセルで対角線の向きを固定。平面での一致、非等方な間隔、重心、集計、除外、分類、領域分類、境界値
+- uncertaintyの連続誤差領域: 7ケース（g < eを4件含む）で、上限が「最小ノルム`max(0, g - e)`と最大ノルム`g + e`での角度のずれの大きい方」と一致すること、誤差円板の内部と周上（9半径×72方向）のどの点でも上限を超えないこと。g < eでは最小ノルムが0で真の勾配が0になり得ること、その場合に測定傾斜より小さい歩行可能角でも`UNWALKABLE`と断定しないこと
+- 実Landscapeのfixture: 平地、一方向斜面、丘の頂点（ピラミッド）、V字谷底、尾根、鞍部、4隅[0,100,100,0]型セル。それぞれ`AnalyzeSlopeNeighborhood`の結果を、GetHeightで読んだ頂点から独立に計算した実三角形の最大・平均・枚数と照合し、中心傾斜が`GetSlope`と一致することを確認
+- 頂点・谷底・尾根・鞍部で中心傾斜が0、局所最大傾斜が周囲の面の角度になること
+- Collisionのline trace: ねじれたセルの中心が0cm、Lower三角形上の点が50cm、法線の傾きが約54.7度
+- `EvaluateWalkabilityRegion`: 平地は全面`WALKABLE`、斜面は閾値の上下で`WALKABLE`／`UNWALKABLE`、半分だけ斜面で`MIXED`・比率0.5、閾値と一致・量子化誤差内で`MIXED`、頂点周りの8枚が急斜面6枚・水平2枚
+- `GetHeightRegion`: v0.2のfieldが不変、実三角形の枚数、1点の領域でも含むセルを評価
+- Validation: 半径0・負・5000超・NaN・Infinity、距離、座標、範囲外、逆転、角度、Path。半径が端を越える場合は拒否せず`bClipped`
+- Sample上限: 62001頂点のLandscapeで領域全体と半径5000cmを拒否。16384頂点ちょうどは成功、1セル超過は拒否。`GetHeightRegion`はv0.2で成功していた入力（全域・200cm間隔）が成功し、実三角形123008枚を評価
+- 読み取りがPackageをdirtyにしない・Undo履歴を増やさない、他Actorの保持、保存イベント0、ロックLayer／回転Landscapeの拒否
+- schemaに10 Tool、Toolset Version `0.3`
+
+### schema互換性
+
+v0.2（`main`）とv0.3の公式生成schemaを比較しました。
+
+- `CreateLandscape`、`GetHeight`、`SculptRegion`、`SmoothRegion`、`FlattenRegion`、`GetSlope`、`EvaluateWalkability`: descriptionを含め完全一致
+- `GetHeightRegion`: 入力schemaとdescriptionは完全一致。出力は既存fieldがすべて完全一致で、`bTriangleSlopeValid`、`maxTriangleSlopeDegrees`、`maxTriangleSlopeLocation`、`triangleCount`の追加だけ
+- 追加: `AnalyzeSlopeNeighborhood`、`EvaluateWalkabilityRegion`
+
+### MCP簡易E2E（Claude Code）
+
+v0.3のBinariesでEditorを起動し、空の未保存Levelに63m四方のLandscapeを作成。中心(3000,3000)・半径600cm・高さ600cmの丘と、頂点(1100,1000)・(1000,1100)だけを100cm上げたねじれたセルをSculptで作りました（すべてDry-run後に本実行）。保存はしていません。
+
+| 確認内容 | 結果 |
+|---|---|
+| 頂点(3000,3000)の`GetSlope` | 0度、方向なし |
+| 頂点の`AnalyzeSlopeNeighborhood`（半径300cm） | `centerSlopeDegrees` 0、`localMaxSlopeDegrees` 58.30、`localMeanSlopeDegrees` 50.19、60枚 |
+| 上の値の照合 | `GetHeightRegion`の`heightsCm`から独立に計算した最大・平均・枚数と一致 |
+| 斜面(3300,3000) | `GetSlope` 55.32度 = `centerSlopeDegrees`。`localMaxSlopeDegrees` 58.30 |
+| `GetHeightRegion`（2400〜3600） | `maxSlopeDegrees` 55.84（v0.2と同じ）、`maxTriangleSlopeDegrees` 58.55、288枚。独立計算と一致。最小・最大・平均はv0.2と同じ値 |
+| `EvaluateWalkabilityRegion`（丘全体、44.77度） | `MIXED`。288枚中`WALKABLE` 154、`NEAR_LIMIT` 0、`UNWALKABLE` 134、比率0.5347、最悪margin -13.78。独立計算した分類数と一致 |
+| 頂点の`EvaluateWalkability`（44.77度） | `WALKABLE`（中心傾斜0のため） |
+| 頂点周り2×2セルの`EvaluateWalkabilityRegion` | `WALKABLE`、最大32.20度。このsmoothstepの丘は頂上付近が緩やかで、急な面は半径300cmの範囲にある |
+| 平地 | 領域`WALKABLE`・比率1、近傍の中心・最大・平均とも0 |
+| ねじれたセル | `heightsCm`は[0,100,100,0]。`maxSlopeDegrees` 0、`maxTriangleSlopeDegrees` 54.74、近傍の`localMaxSlopeDegrees` 54.74、領域`UNWALKABLE` |
+| ねじれたセルのCollision | 中心のline trace 0cm（bilinearのGetHeightは50cm）、Lower三角形上の点 50.0cm |
+| 失敗系 | 半径0、中心傾斜の4点が端の外、矩形が範囲外、逆転、角度91はすべてFAIL |
+| 半径が端を越える場合 | 成功し`bClipped:true` |
+
+最初のE2E呼び出しはEditor再起動直後で、MCPセッションの期限切れエラーが返りました。Editor側では処理が1回だけ完了しており（頂点の高さ600cm、ねじれたセルの高さ100cmで確認）、以降の読み取りはその状態に対して行っています。

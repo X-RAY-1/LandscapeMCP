@@ -1,8 +1,29 @@
 # Changelog
 
-## v0.2.0 — 未リリース（レビュー前）
+## v0.3.0 — 未リリース（レビュー前）
 
-地形評価機能を追加。`feature/v0.2-terrain-analysis`で作業中で、`main`へは未Mergeです。
+地形評価の局所性と、歩行可能性評価の実用性を強化。`feature/v0.3-terrain-analysis-hardening`で作業中で、`main`へは未Mergeです。
+
+- AnalyzeSlopeNeighborhood追加: 中心傾斜（GetSlopeと同じ中心差分）と、周囲のLandscape実三角形から求めた局所最大・平均傾斜を返す。頂点・尾根・谷底・鞍部のように中心傾斜が0になる場所でも、周囲の急斜面を検出できる
+- EvaluateWalkabilityRegion追加: 矩形領域の実三角形を歩行可能角に対して一括評価し、WALKABLE / NEAR_LIMIT / UNWALKABLEの数、比率、最大傾斜、最悪の位置、領域の分類（WALKABLE / MIXED / UNWALKABLE）を返す
+- GetHeightRegionへ実三角形の集計を追加: `bTriangleSlopeValid`、`maxTriangleSlopeDegrees`、`maxTriangleSlopeLocation`、`triangleCount`。4隅が[0,100,100,0]のように平均gradientが0になるセルでも、実三角形の急斜面を検出できる
+- 三角形分割はUE5.8の描画・Collisionと同じ対角線00-11。Engineソースと、Collisionのline traceによる実測（Automationにも追加）で確認
+- 計算層へ三角形の傾斜・集計・領域分類を追加。`slopeUncertaintyDegrees`の式を、勾配誤差を直接受け取る形でも使えるよう分離（式は無変更）
+- Automation Test `LandscapeMCP.V03.TerrainHardening`追加。uncertaintyの連続誤差領域（g < e、真の勾配が0になるケース、最小・最大ノルムの境界）を直接検証
+- docsで中心傾斜と局所最大傾斜の違い、`NEAR_LIMIT`が量子化誤差だけに対する測定上の区分であることを明記
+
+互換性:
+
+- 既存8 Toolの入力schema、挙動、安全境界、エラー文字列は変更なし
+- `GetSlope`の中心差分、`GetHeightRegion.maxSlopeDegrees`（4隅平均gradient）、`slopeUncertaintyDegrees`の式は定義を変えていない
+- `GetHeightRegion`の出力schemaは4 fieldの追加だけ（追加のみ、既存fieldの意味は不変）。v0.2で成功していた入力は引き続き成功する
+- 新2 Toolは読み取り専用。Transaction・Modify・Package dirty化なし
+- Toolset Versionを`0.2`から`0.3`へ、Plugin descriptorの`Version`を3、`VersionName`を`0.3`へ変更。Tool数は8から10へ増加
+- v0.2のAutomation `LandscapeMCP.V02.TerrainAnalysis`にあったToolset Version `0.2`の完全一致確認は、「0.2以降」の確認へ変更（Versionを上げると必ず失敗するため）。完全一致はV03で確認する
+
+## v0.2.0 — 2026-10-06
+
+地形評価機能を追加。
 
 - GetSlope追加: 指定World XYの傾斜角・最大上昇方向・法線を取得
 - GetHeightRegion追加: 矩形領域の高度を格子で取得し、最小・最大・平均・最大傾斜セルを集計

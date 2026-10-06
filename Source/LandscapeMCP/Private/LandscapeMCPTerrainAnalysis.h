@@ -28,6 +28,9 @@ namespace LandscapeMCP::Analysis
      */
     double SlopeUncertaintyDegrees(const FSlope& Slope, double QuantizationCm, double DistanceCm);
 
+    /** 勾配誤差の上限GradientErrorが分かっている場合の傾斜角誤差上限(度)。SlopeUncertaintyDegreesと同じ式。 */
+    double SlopeUncertaintyFromGradientError(double GradientMagnitude, double GradientError);
+
     enum class EWalkability { Walkable, NearLimit, Unwalkable };
     struct FWalkability
     {
@@ -56,4 +59,50 @@ namespace LandscapeMCP::Analysis
 
     /** 行優先(Yが外側、Xが内側)の等間隔格子を集計する。セル傾斜は4隅の前進差分の平均から求める。 */
     FRegionStats ComputeRegionStats(TConstArrayView<double> Heights, int32 CountX, int32 CountY, double SpacingCm);
+
+    /** Landscapeの1セルを構成する2つの三角形。
+     * UE5.8の描画(LandscapeRender.cppのindex順)とCollision(Chaos FHeightField)はどちらも、
+     * セルの4頂点(00,10,01,11)を対角線00-11で分割する。Collisionのline traceによる実測でも確認している。
+     * Lower=(00,10,11)でセル内の重心は(2/3,1/3)、Upper=(00,01,11)で重心は(1/3,2/3)。
+     */
+    struct FCellTriangles
+    {
+        FSlope Lower;
+        FSlope Upper;
+    };
+    FCellTriangles CellTriangleSlopes(double H00, double H10, double H01, double H11, double SpacingX, double SpacingY);
+
+    /** 三角形の重心。格子単位の座標で返す。 */
+    FVector2D TriangleCentroid(int32 CellX, int32 CellY, bool bUpper);
+
+    /** 三角形の勾配誤差の上限。各軸の勾配は隣接2頂点の差なので誤差はQuantizationCm/Spacing以下、2軸を合成する。 */
+    double TriangleGradientError(double QuantizationCm, double SpacingX, double SpacingY);
+
+    struct FTriangleStats
+    {
+        int32 TriangleCount = 0;
+        double MaxSlopeDegrees = 0;
+        double MeanSlopeDegrees = 0; // 三角形はXY面積が等しいため、単純平均が面積加重平均になる。
+        FSlope MaxSlope;
+        int32 MaxCellX = INDEX_NONE;
+        int32 MaxCellY = INDEX_NONE;
+        bool bMaxIsUpper = false;
+        double MaxSlopeUncertaintyDegrees = 0;
+        // WalkableFloorAngleDegに対する三角形ごとの分類数。合計はTriangleCount。
+        int32 WalkableCount = 0;
+        int32 NearLimitCount = 0;
+        int32 UnwalkableCount = 0;
+    };
+
+    /** 行優先(Yが外側、Xが内側)の頂点格子上の三角形を集計する。
+     * Includeは(CellX, CellY, bUpper)を受け取り、falseを返した三角形を除外する。
+     * 分類はEvaluateWalkabilityと同じ規則で、不確かさは三角形ごとの量子化誤差上限を使う。
+     */
+    FTriangleStats ComputeTriangleStats(TConstArrayView<double> Heights, int32 CountX, int32 CountY, double SpacingX, double SpacingY,
+        double WalkableFloorAngleDeg, double QuantizationCm, TFunctionRef<bool(int32, int32, bool)> Include);
+
+    enum class ERegionWalkability { Walkable, Mixed, Unwalkable };
+    /** 全三角形がWALKABLEならWalkable、全三角形がUNWALKABLEならUnwalkable、それ以外(NEAR_LIMITを含む)はMixed。 */
+    ERegionWalkability ClassifyRegion(const FTriangleStats& Stats);
+    const TCHAR* ToString(ERegionWalkability Classification);
 }
