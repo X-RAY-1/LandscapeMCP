@@ -91,3 +91,40 @@ v0.2のBinariesでEditorを起動し、登録済みの公式MCPから`call_tool`
 丘の頂点(3000,3000)は傾斜0・`WALKABLE`と評価されました。中心差分が対称な地形で打ち消し合うためで、[制限](limitations.md)に記載しています。
 
 稼働中Editorの「新規レベル」はモーダルダイアログを開き、その間MCP呼び出しが止まるため、MCPからは操作できませんでした。空の未保存Levelは、起動Mapを空にする起動オプション（`-ini:Engine:[/Script/EngineSettings.GameMapsSettings]:EditorStartupMap=`）でEditorを起動して用意しています。Projectの設定ファイルは変更していません。
+
+## v0.2 レビュー修正後の再検証（2026-10-06）
+
+Codexレビュー（`REQUEST_CHANGES`、P2）を受け、`slopeUncertaintyDegrees`を一次近似`e / (1 + g²)`から、`atan`の差を両側で評価する保守的な上限へ変更しました。変更はこの計算式とテスト・docsだけで、`NEAR_LIMIT`の意味、field名、schema、Safetyは変えていません。
+
+| 項目 | 結果 |
+|---|---|
+| Build（RunUAT BuildPlugin、Win64） | `BUILD SUCCESSFUL`、終了コード0 |
+| `LandscapeMCP.V01.SafetyAndOperations` | Success、エラー0、警告0 |
+| `LandscapeMCP.V02.TerrainAnalysis` | Success、エラー0、警告0 |
+| schema | 全8 Toolが修正前のv0.2とdescriptionを含め完全一致 |
+
+追加したAutomationの対象:
+
+- 計算層の11ケース（平坦、最小distance、斜め、急斜面、勾配が誤差より小さい場合、Scale.Zの最大・最小など）で、仕様の式と一致すること、4点の高さが±q/2ずれる全9通りの傾斜角のずれを上回ること
+- レビューの反例（Scale.Z=100、distance 1cm、斜め45度）: 量子化だけで約24.1度まで下がり得るのに対し、一次近似の幅は約15.8度で上限にならないこと、修正後の幅（約20.9度）が上限になること
+- 閾値反転: 上の反例を歩行可能角27度で評価すると、一次近似では`UNWALKABLE`と断定されていたものが`NEAR_LIMIT`になること
+- 平坦側: 公称0度・distance 1cmで幅が約28.9度になり、歩行可能角20度は`NEAR_LIMIT`、40度は`WALKABLE`
+- 実Landscape Scale(1,1,100)・distance 1cm: 平坦と斜め（約47.85度）の両方。歩行可能角30度が`NEAR_LIMIT`、10度が`UNWALKABLE`、80度が`WALKABLE`
+- 実Landscape Scale(200,50,25)の非等方: 傾斜・方向・幅が式と一致。distanceを50cmから1cmへ縮めると幅が広がること
+- Scale(100,100,100)の約46.9度の斜面: 歩行可能角40度でdistance 100cmは`UNWALKABLE`、distance 1cmは`NEAR_LIMIT`
+
+MCP簡易E2E（Claude Code）は修正版Binariesで再実行しました。空の未保存Levelに前回と同じLandscapeと丘を作成（Dry-run後に本実行）。保存はしていません。
+
+| 確認内容 | 結果 |
+|---|---|
+| 傾斜・方向・`heightCenterCm` | 7ケースすべてGetHeightからの手計算と一致（前回と同じ値） |
+| `slopeUncertaintyDegrees` | 7ケースすべて仕様の式と一致 |
+| distance 100cm | 平坦0.3165度、斜面約0.103度。一次近似との差は0.001度未満 |
+| distance 1cm・平坦 | 28.92度（一次近似は31.65度） |
+| distance 1cm・約55度の斜面 | 13.56〜13.83度（一次近似は10.25〜10.44度で過小） |
+| 閾値反転（約54.95度、distance 1cm、歩行可能角43度） | margin -11.95、`NEAR_LIMIT`。一次近似の幅10.44度では`UNWALKABLE`になっていたケース |
+| 明確なケース | distance 100cmの44.77度は`UNWALKABLE`、60度は`WALKABLE`で前回と同じ |
+| GetHeightRegion | 169 Sample、最小0・最大600・平均120.5067で前回と同じ |
+| 端での計測 | FAIL（clipなし） |
+
+`NEAR_LIMIT`／`slopeUncertaintyDegrees`の名称見直しと`localMaxSlopeDegrees`はnon-blockingの指摘で、v0.3候補として[制限](limitations.md)に記載しました。

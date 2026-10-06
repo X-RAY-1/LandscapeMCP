@@ -16,6 +16,7 @@ PIE／Save／GC中の操作、nested write transaction、入力・作成・編�
 - Heightmap適用Tool
 - 独立RebuildCollision Tool
 - World Partition／Proxy対応
+- v0.3候補: `NEAR_LIMIT`／`slopeUncertaintyDegrees`の名称見直し、`sampleDistanceCm`の範囲内の局所最大傾斜（`localMaxSlopeDegrees`）。頂点・尾根での打ち消しへの対処を含みます
 
 ## 地形評価Tool（v0.2）の制限
 

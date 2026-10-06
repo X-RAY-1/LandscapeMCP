@@ -21,9 +21,10 @@ namespace LandscapeMCP::Analysis
     /** 中心差分。各高さは中心からDistanceCmだけ離れた4点のワールドZ。 */
     FSlope SlopeFromHeights(double HeightXMinus, double HeightXPlus, double HeightYMinus, double HeightYPlus, double DistanceCm);
 
-    /** 高さ量子化が中心差分の傾斜角へ与え得る最大誤差(度)。
+    /** 高さ量子化が中心差分の傾斜角へ与え得る誤差の保守的な上限(度)。
      * 各サンプルの誤差はQuantizationCm/2以下なので、軸ごとの勾配誤差はQuantizationCm/(2*DistanceCm)以下、
-     * 2軸合成でsqrt(2)倍。d(atan g)=dg/(1+g^2)により角度へ換算する。
+     * 2軸合成で e = sqrt(2)*QuantizationCm/(2*DistanceCm)。勾配の大きさgは[max(0,g-e), g+e]に収まり、
+     * atanは単調なので max(atan(g+e)-atan(g), atan(g)-atan(max(0,g-e))) が角度誤差の上限となる。
      */
     double SlopeUncertaintyDegrees(const FSlope& Slope, double QuantizationCm, double DistanceCm);
 

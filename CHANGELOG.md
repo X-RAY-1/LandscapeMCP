@@ -12,6 +12,7 @@
 - 計算層`LandscapeMCPTerrainAnalysis`を追加し、MCP facade・Landscape読み取りから分離
 - Automation Test `LandscapeMCP.V02.TerrainAnalysis`追加
 - README / docsを更新
+- レビュー修正: `slopeUncertaintyDegrees`を一次近似`e/(1+g²)`から、`atan`の差を両側で評価する保守的な上限へ変更。量子化だけで歩行可能性の判定が反転し得るケースが`NEAR_LIMIT`から漏れる問題を修正。schemaとfield名は変更なし
 
 互換性:
 

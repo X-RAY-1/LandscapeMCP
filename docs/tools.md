@@ -141,11 +141,17 @@ normal                = normalize(-gx, -gy, 1)
 
 4点のうち1つでもLandscape外ならFAILします。端で片側差分へ切り替えると傾斜の定義が変わるためです。縁から`sampleDistanceCm`未満の位置は計測できません。
 
-`slopeUncertaintyDegrees`は次の式で求めます。各高さの量子化誤差は`heightQuantizationCm / 2`以下なので、軸ごとの勾配誤差は`q / (2d)`以下、2軸合成で√2倍、角度へは`1 / (1 + g²)`で換算します。
+`slopeUncertaintyDegrees`は、高さ量子化による傾斜角誤差の保守的な上限です。各高さの量子化誤差は`heightQuantizationCm / 2`以下なので、軸ごとの勾配誤差は`q / (2d)`以下、2軸合成で√2倍になります。勾配の大きさ`g`は`[max(0, g - e), g + e]`に収まり、`atan`は単調なので、両側の角度差の大きい方が上限です。
 
 ```
-slopeUncertaintyDegrees = degrees( sqrt(2) * heightQuantizationCm / (2 * sampleDistanceCm) / (1 + gx² + gy²) )
+e = sqrt(2) * heightQuantizationCm / (2 * sampleDistanceCm)
+g = hypot(gx, gy)
+upper = atan(g + e) - atan(g)
+lower = atan(g) - atan(max(0, g - e))
+slopeUncertaintyDegrees = degrees(max(upper, lower))
 ```
+
+一次近似`e / (1 + g²)`は使いません。`e`が`g`に対して小さくない場合（Scale.Zが大きい、`sampleDistanceCm`が小さい）に上限とならず、量子化だけで判定が反転し得る範囲を`NEAR_LIMIT`から漏らすためです。
 
 ```json
 {"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_TestLandscape","worldX":2700,"worldY":3150,"sampleDistanceCm":100}

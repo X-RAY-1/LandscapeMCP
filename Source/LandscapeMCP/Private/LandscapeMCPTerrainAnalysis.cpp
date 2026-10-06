@@ -33,9 +33,13 @@ FSlope SlopeFromHeights(double HeightXMinus, double HeightXPlus, double HeightYM
 
 double SlopeUncertaintyDegrees(const FSlope& Slope, double QuantizationCm, double DistanceCm)
 {
+    // 一次近似 e/(1+g^2) は有限な誤差に対する上限にならないため、atanの差を両側で直接評価する。
     const double GradientError = UE_DOUBLE_SQRT_2 * QuantizationCm / (2.0*DistanceCm);
-    const double Squared = Slope.GradientX*Slope.GradientX + Slope.GradientY*Slope.GradientY;
-    return FMath::RadiansToDegrees(GradientError / (1.0+Squared));
+    const double Magnitude = FMath::Sqrt(Slope.GradientX*Slope.GradientX + Slope.GradientY*Slope.GradientY);
+    const double Angle = FMath::Atan(Magnitude);
+    const double Upper = FMath::Atan(Magnitude+GradientError) - Angle;
+    const double Lower = Angle - FMath::Atan(FMath::Max(0.0, Magnitude-GradientError));
+    return FMath::RadiansToDegrees(FMath::Max(Upper, Lower));
 }
 
 FWalkability EvaluateWalkability(double SlopeDegrees, double WalkableFloorAngleDeg, double UncertaintyDegrees)

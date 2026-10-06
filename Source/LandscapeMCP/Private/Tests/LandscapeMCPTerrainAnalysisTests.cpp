@@ -48,6 +48,35 @@ namespace
         return true;
     }
     double Degrees(double Gradient) { return FMath::RadiansToDegrees(FMath::Atan(Gradient)); }
+
+    // 仕様どおりの上限。実装とは独立に計算する。
+    double ExpectedUncertainty(double GradientX, double GradientY, double QuantizationCm, double DistanceCm)
+    {
+        const double E = FMath::Sqrt(2.0)*QuantizationCm/(2.0*DistanceCm);
+        const double G = FMath::Sqrt(GradientX*GradientX + GradientY*GradientY);
+        return FMath::Max(Degrees(G+E)-Degrees(G), Degrees(G)-Degrees(FMath::Max(0.0,G-E)));
+    }
+    // レビューで否定された一次近似。上限にならないことを示す比較用。
+    double FirstOrderUncertainty(double GradientX, double GradientY, double QuantizationCm, double DistanceCm)
+    {
+        const double E = FMath::Sqrt(2.0)*QuantizationCm/(2.0*DistanceCm);
+        return FMath::RadiansToDegrees(E/(1.0 + GradientX*GradientX + GradientY*GradientY));
+    }
+    // 4点の高さがそれぞれ+-QuantizationCm/2ずれた場合、軸ごとの勾配は-q/(2d)、0、+q/(2d)のいずれかだけ変わる。
+    // 全9通りで傾斜角のずれの最大値を求める。
+    double WorstQuantizedDeviation(double GradientX, double GradientY, double QuantizationCm, double DistanceCm)
+    {
+        const double Step = QuantizationCm/(2.0*DistanceCm);
+        const double Nominal = LandscapeMCP::Analysis::SlopeFromGradient(GradientX,GradientY).SlopeDegrees;
+        double Worst = 0;
+        for (int32 SX = -1; SX <= 1; ++SX)
+            for (int32 SY = -1; SY <= 1; ++SY)
+            {
+                const double Perturbed = LandscapeMCP::Analysis::SlopeFromGradient(GradientX+SX*Step,GradientY+SY*Step).SlopeDegrees;
+                Worst = FMath::Max(Worst,FMath::Abs(Perturbed-Nominal));
+            }
+        return Worst;
+    }
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLandscapeMCPTerrainAnalysisTest,"LandscapeMCP.V02.TerrainAnalysis",
@@ -87,6 +116,53 @@ bool FLandscapeMCPTerrainAnalysisTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("analysis region max index"),Stats.MaxIndex,5);
         TestTrue(TEXT("analysis steepest cell is the second"),Stats.bSlopeValid && Stats.MaxSlopeCellX == 1 && Stats.MaxSlopeCellY == 0);
         TestFalse(TEXT("analysis single row has no cell slope"),Analysis::ComputeRegionStats(MakeArrayView(Grid,3),3,1,10).bSlopeValid);
+    }
+
+    // --- slopeUncertaintyDegrees: 量子化による傾斜角誤差の保守的な上限であること ---
+    {
+        struct FCase { const TCHAR* Name; double GX, GY, Q, D; };
+        const double Q100 = 100.0/128.0; // Scale.Z=100
+        const FCase Cases[] = {
+            { TEXT("flat, Scale.Z 100, distance 100"), 0,0,Q100,100 },
+            { TEXT("flat, minimum distance"), 0,0,Q100,1 },
+            { TEXT("ramp 0.5, distance 100"), 0.5,0,Q100,100 },
+            { TEXT("review counterexample: Scale.Z 100, distance 1, gradient 1"), 1,0,Q100,1 },
+            { TEXT("review counterexample diagonal"), FMath::Sqrt(0.5),FMath::Sqrt(0.5),Q100,1 },
+            { TEXT("diagonal, distance 5"), 0.6,0.8,Q100,5 },
+            { TEXT("steep 3.0, minimum distance"), 3,0,Q100,1 },
+            { TEXT("steep diagonal, distance 2"), 2,2,Q100,2 },
+            { TEXT("gradient smaller than error"), 0.1,0.05,Q100,1 },
+            { TEXT("maximum Scale.Z, minimum distance"), 1,1,1000.0/128.0,1 },
+            { TEXT("minimum Scale.Z, maximum distance"), 0.5,0.5,1.0/128.0,5000 },
+        };
+        for (const FCase& C : Cases)
+        {
+            const Analysis::FSlope Slope = Analysis::SlopeFromGradient(C.GX,C.GY);
+            const double Uncertainty = Analysis::SlopeUncertaintyDegrees(Slope,C.Q,C.D);
+            TestEqual(*FString::Printf(TEXT("uncertainty formula: %s"),C.Name),Uncertainty,ExpectedUncertainty(C.GX,C.GY,C.Q,C.D),1.e-9);
+            TestTrue(*FString::Printf(TEXT("uncertainty bounds every quantized perturbation: %s"),C.Name),
+                WorstQuantizedDeviation(C.GX,C.GY,C.Q,C.D) <= Uncertainty + 1.e-9);
+            TestTrue(*FString::Printf(TEXT("uncertainty is finite and non-negative: %s"),C.Name),FMath::IsFinite(Uncertainty) && Uncertainty >= 0);
+        }
+        // 反例: 斜め45度、Scale.Z=100、距離1cm。量子化だけで傾斜は約24.1度まで下がり得る。
+        const double GD = FMath::Sqrt(0.5);
+        const double Worst = WorstQuantizedDeviation(GD,GD,Q100,1);
+        const double FirstOrder = FirstOrderUncertainty(GD,GD,Q100,1);
+        const double Uncertainty = Analysis::SlopeUncertaintyDegrees(Analysis::SlopeFromGradient(GD,GD),Q100,1);
+        TestTrue(TEXT("first-order approximation is not an upper bound for the counterexample"),FirstOrder < Worst);
+        TestTrue(TEXT("corrected uncertainty covers the counterexample"),Uncertainty >= Worst - 1.e-9);
+        // 閾値反転: 歩行可能角27度。公称45度だが量子化だけで27度未満になり得るため、UNWALKABLEと断定してはならない。
+        const double Angle = 27.0;
+        TestTrue(TEXT("counterexample can flip below the threshold"),45.0 - Worst < Angle);
+        TestTrue(TEXT("first-order width would have missed the flip"),FMath::Abs(Angle-45.0) > FirstOrder);
+        const Analysis::FWalkability Flip = Analysis::EvaluateWalkability(45.0,Angle,Uncertainty);
+        TestTrue(TEXT("flip case is classified NEAR_LIMIT"),Flip.Classification == Analysis::EWalkability::NearLimit);
+        TestFalse(TEXT("flip case keeps nominal bWalkable"),Flip.bWalkable);
+        // 平坦側: 公称0度でも量子化だけで約28.9度まで上がり得る。歩行可能角20度はNEAR_LIMIT、40度はWALKABLE。
+        const double FlatUncertainty = Analysis::SlopeUncertaintyDegrees(Analysis::SlopeFromGradient(0,0),Q100,1);
+        TestEqual(TEXT("flat uncertainty at minimum distance"),FlatUncertainty,Degrees(FMath::Sqrt(2.0)*Q100/2.0),1.e-9);
+        TestTrue(TEXT("flat flip case is NEAR_LIMIT"),Analysis::EvaluateWalkability(0,20,FlatUncertainty).Classification == Analysis::EWalkability::NearLimit);
+        TestTrue(TEXT("flat clear case is WALKABLE"),Analysis::EvaluateWalkability(0,40,FlatUncertainty).Classification == Analysis::EWalkability::Walkable);
     }
 
     // --- 隔離した未保存LevelでのLandscape読み取り ---
@@ -259,6 +335,74 @@ bool FLandscapeMCPTerrainAnalysisTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("steep slope angle"),W.SlopeDegrees,Degrees(137.0/128.0),Tolerance);
     TestFalse(TEXT("47 degree slope is unwalkable at 44.77"),W.bWalkable);
     TestEqual(TEXT("steep classification"),W.Classification,FString(TEXT("UNWALKABLE")));
+
+    // 最小distance: 平面なので傾斜は同じ、不確かさだけが広がる
+    S = Slope(Path,1400,1400,1);
+    TestTrue(*S.Message,S.bSuccess);
+    TestEqual(TEXT("minimum distance slope"),S.SlopeDegrees,Degrees(137.0/128.0),Tolerance);
+    TestEqual(TEXT("minimum distance uncertainty"),S.SlopeUncertaintyDegrees,ExpectedUncertainty(137.0/128.0,0,0.78125,1),Tolerance);
+    TestTrue(TEXT("minimum distance uncertainty bounds perturbations"),WorstQuantizedDeviation(137.0/128.0,0,0.78125,1) <= S.SlopeUncertaintyDegrees + Tolerance);
+    // 約46.9度を歩行可能角40度で評価。距離100では明確にUNWALKABLE、距離1では量子化で反転し得るためNEAR_LIMIT。
+    TestEqual(TEXT("steep at distance 100 is UNWALKABLE"),Walkability(Path,1400,1400,40,100).Classification,FString(TEXT("UNWALKABLE")));
+    W = Walkability(Path,1400,1400,40,1);
+    TestEqual(TEXT("steep at minimum distance is NEAR_LIMIT"),W.Classification,FString(TEXT("NEAR_LIMIT")));
+    TestFalse(TEXT("steep at minimum distance keeps nominal bWalkable"),W.bWalkable);
+    TestEqual(TEXT("walkability uncertainty equals GetSlope"),W.SlopeUncertaintyDegrees,S.SlopeUncertaintyDegrees,Tolerance);
+
+    // レビューの反例: Scale(1,1,100)、distance 1cm。量子化刻み0.78125cmに対して水平距離が1cmしかない。
+    {
+        const FLandscapeMCPResult Fine = Create(LevelPath,TEXT("AI_FineLandscape"),FVector(5000,0,0),FVector(1,1,100),1,1,1,7,0,false);
+        if (!TestTrue(*Fine.Message,Fine.bSuccess)) { return false; }
+        ALandscape* FineActor = FindObject<ALandscape>(nullptr,*Fine.LandscapePath);
+        if (!TestNotNull(TEXT("fine Landscape"),FineActor)) { return false; }
+        // 平坦: 公称0度でも不確かさは約28.9度
+        FLandscapeMCPSlopeResult F = Slope(Fine.LandscapePath,5003.5,3.5,1);
+        TestTrue(*F.Message,F.bSuccess);
+        TestEqual(TEXT("fine flat slope"),F.SlopeDegrees,0.0,Tolerance);
+        TestEqual(TEXT("fine flat uncertainty"),F.SlopeUncertaintyDegrees,ExpectedUncertainty(0,0,0.78125,1),Tolerance);
+        TestEqual(TEXT("fine flat near threshold is NEAR_LIMIT"),Walkability(Fine.LandscapePath,5003.5,3.5,20,1).Classification,FString(TEXT("NEAR_LIMIT")));
+        TestEqual(TEXT("fine flat clear of threshold is WALKABLE"),Walkability(Fine.LandscapePath,5003.5,3.5,40,1).Classification,FString(TEXT("WALKABLE")));
+        // 斜め: 1格子(1cm)あたり1単位(0.78125cm)ずつ。勾配(0.78125,0.78125)、約47.85度。
+        if (!TestTrue(TEXT("fine diagonal fixture"),SetPlaneFixture(FineActor,1,1))) { return false; }
+        const double G = 0.78125;
+        F = Slope(Fine.LandscapePath,5003.5,3.5,1);
+        TestTrue(*F.Message,F.bSuccess);
+        TestEqual(TEXT("fine diagonal slope"),F.SlopeDegrees,Degrees(G*FMath::Sqrt(2.0)),Tolerance);
+        TestEqual(TEXT("fine diagonal direction"),F.SlopeDirectionDegrees,45.0,Tolerance);
+        TestEqual(TEXT("fine diagonal uncertainty"),F.SlopeUncertaintyDegrees,ExpectedUncertainty(G,G,0.78125,1),Tolerance);
+        const double FineWorst = WorstQuantizedDeviation(G,G,0.78125,1);
+        TestTrue(TEXT("fine diagonal uncertainty bounds perturbations"),FineWorst <= F.SlopeUncertaintyDegrees + Tolerance);
+        TestTrue(TEXT("fine diagonal: first-order approximation was not a bound"),FirstOrderUncertainty(G,G,0.78125,1) < FineWorst);
+        // 歩行可能角30度: 公称は約17.9度超過だが、量子化だけで約28.9度まで下がり得る
+        const FLandscapeMCPWalkabilityResult FW = Walkability(Fine.LandscapePath,5003.5,3.5,30,1);
+        TestTrue(*FW.Message,FW.bSuccess);
+        TestTrue(TEXT("fine diagonal margin exceeds first-order width"),FMath::Abs(FW.MarginDegrees) > FirstOrderUncertainty(G,G,0.78125,1));
+        TestTrue(TEXT("fine diagonal can flip below the threshold"),FW.SlopeDegrees - FineWorst < 30.0);
+        TestEqual(TEXT("fine diagonal threshold flip is NEAR_LIMIT"),FW.Classification,FString(TEXT("NEAR_LIMIT")));
+        TestFalse(TEXT("fine diagonal keeps nominal bWalkable"),FW.bWalkable);
+        TestEqual(TEXT("fine diagonal far above threshold is UNWALKABLE"),Walkability(Fine.LandscapePath,5003.5,3.5,10,1).Classification,FString(TEXT("UNWALKABLE")));
+        TestEqual(TEXT("fine diagonal far below threshold is WALKABLE"),Walkability(Fine.LandscapePath,5003.5,3.5,80,1).Classification,FString(TEXT("WALKABLE")));
+    }
+
+    // 非等方Scale(200,50,25): 1格子あたり64単位(12.5cm)。勾配はX方向0.0625、Y方向0.25。
+    {
+        const FLandscapeMCPResult Aniso = Create(LevelPath,TEXT("AI_AnisoLandscape"),FVector(8000,0,0),FVector(200,50,25),1,1,1,7,0,false);
+        if (!TestTrue(*Aniso.Message,Aniso.bSuccess)) { return false; }
+        ALandscape* AnisoActor = FindObject<ALandscape>(nullptr,*Aniso.LandscapePath);
+        if (!TestNotNull(TEXT("anisotropic Landscape"),AnisoActor)) { return false; }
+        if (!TestTrue(TEXT("anisotropic fixture"),SetPlaneFixture(AnisoActor,64,64))) { return false; }
+        const double GX = 12.5/200.0, GY = 12.5/50.0, Q = 25.0/128.0;
+        const FLandscapeMCPSlopeResult A = Slope(Aniso.LandscapePath,8700,175,50);
+        TestTrue(*A.Message,A.bSuccess);
+        TestEqual(TEXT("anisotropic quantization"),A.HeightQuantizationCm,Q,Tolerance);
+        TestEqual(TEXT("anisotropic slope"),A.SlopeDegrees,Degrees(FMath::Sqrt(GX*GX+GY*GY)),Tolerance);
+        TestEqual(TEXT("anisotropic direction"),A.SlopeDirectionDegrees,FMath::RadiansToDegrees(FMath::Atan2(GY,GX)),Tolerance);
+        TestEqual(TEXT("anisotropic uncertainty"),A.SlopeUncertaintyDegrees,ExpectedUncertainty(GX,GY,Q,50),Tolerance);
+        TestTrue(TEXT("anisotropic uncertainty bounds perturbations"),WorstQuantizedDeviation(GX,GY,Q,50) <= A.SlopeUncertaintyDegrees + Tolerance);
+        const FLandscapeMCPSlopeResult AMin = Slope(Aniso.LandscapePath,8700,175,1);
+        TestEqual(TEXT("anisotropic minimum distance uncertainty"),AMin.SlopeUncertaintyDegrees,ExpectedUncertainty(GX,GY,Q,1),Tolerance);
+        TestTrue(TEXT("smaller distance widens uncertainty"),AMin.SlopeUncertaintyDegrees > A.SlopeUncertaintyDegrees);
+    }
 
     // 読み取り専用: Package、Undo履歴、他Actorを変更しない
     World->GetOutermost()->SetDirtyFlag(false);
