@@ -1,5 +1,7 @@
 # 検証要約
 
+この文書は、各バージョンの開発時に行った検証の記録を、時系列で残したものです。レビュー前の結果や、当時のbranch名を含みます。最新の状態は末尾の「v0.3.0 公開準備の検証」を参照してください。
+
 ## FreezeまでのE2E（2026-10-05〜2026-10-06）
 
 判定: **LandscapeMCP v0.1: FREEZE CANDIDATE**。
@@ -197,3 +199,25 @@ v0.3のBinariesでEditorを起動し、空の未保存Levelに63m四方のLandsc
 | 半径が端を越える場合 | 成功し`bClipped:true` |
 
 最初のE2E呼び出しはEditor再起動直後で、MCPセッションの期限切れエラーが返りました。Editor側では処理が1回だけ完了しており（頂点の高さ600cm、ねじれたセルの高さ100cmで確認）、以降の読み取りはその状態に対して行っています。
+
+## v0.3.0 公開準備の検証（2026-10-06）
+
+公開準備では機能を変更していません。変更はLICENSEの追加、README・CHANGELOG・docsの整理、パッケージ設定（`Config/FilterPlugin.ini`）、Plugin descriptorの`CreatedBy`だけです。
+
+検証は、release branchをcloneし直したclean checkoutに対して行いました。
+
+| 項目 | 結果 |
+|---|---|
+| Build（RunUAT BuildPlugin、UE5.8、Win64） | `BUILD SUCCESSFUL`、終了コード0 |
+| `LandscapeMCP.V01.SafetyAndOperations` | Success、エラー0、警告0 |
+| `LandscapeMCP.V02.TerrainAnalysis` | Success、エラー0、警告0 |
+| `LandscapeMCP.V03.TerrainHardening` | Success、エラー0、警告0 |
+| `git diff --check` | 指摘なし |
+| secret・個人情報の確認 | 管理対象のファイルとGit履歴の差分に、credential、token、ローカルの絶対パス、ユーザー名は見つからず |
+| `LICENSE` | 公式のApache License 2.0全文とSHA-256が一致 |
+
+Automationは、`ToolsetRegistry`と本Pluginだけを有効にした隔離Projectで実行しました。
+
+BuildPluginの出力には次のものが含まれます。`Source`、`Binaries/Win64`（`.dll`、`.pdb`、`UnrealEditor.modules`）、`Config/FilterPlugin.ini`、`LandscapeMCP.uplugin`、`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`、`Intermediate`。配布物からは`Intermediate`と`.pdb`を除きます。`.dll`にローカルの絶対パスやユーザー名が埋め込まれていないことを確認しました。
+
+MCP経由のE2Eは、公開準備では再実行していません。コードがv0.3のMerge時点から変わっていないためです。
