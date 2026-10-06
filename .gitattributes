@@ -1,0 +1,2 @@
+# 公式のApache-2.0全文と1byteも変えないため、改行をLFに固定する。
+LICENSE text eol=lf

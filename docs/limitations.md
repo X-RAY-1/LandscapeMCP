@@ -47,4 +47,4 @@ GetHeightは元Heightfieldのbilinear値であり、Collision高さそのもの�
 
 公式StartPIEが`PIE ended before warmup completed.`と返した直後にPIEが起動済みのケースを確認しました。LandscapeMCPの不具合として分類していません。状態を確認し、無条件retryを避けます。
 
-UE5.8／Windows 11／Win64 Editor以外は未検証。使用したVisual Studio 14.51 toolchainはEngine推奨14.50より新しいというBuild警告がありました。Licenseは未指定です。
+UE5.8／Windows 11／Win64 Editor以外は未検証です。検証に使用したVisual Studio 14.51 toolchainは、Engine推奨の14.50より新しいというBuild警告が出ていました。

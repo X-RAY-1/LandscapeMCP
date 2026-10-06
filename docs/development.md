@@ -1,10 +1,10 @@
 # 開発手順と運用
 
-## 言語・Freeze baseline
+## 言語と構成
 
 README、docs、CHANGELOG、コードコメント、テスト意図のコメント、PRタイトル／本文は日本語を原則とします。C++識別子、UE API、MCP Tool、schema field、ファイル名、Git／GitHub用語は英語のままです。Commit messageは日本語可。
 
-v0.1.0整理ではコメント以外のC++／Build.csトークンとPlugin descriptorをFreeze版と照合し、一致を確認します。既存実装のエラー文字列・Automation assertion文字列は実行データのため変更しません。Testsは`Source/LandscapeMCP/Private/Tests`に保持します。
+既存実装のエラー文字列・Automation assertion文字列は実行データのため、理由なく変更しません。Testsは`Source/LandscapeMCP/Private/Tests`に置きます。
 
 計算ロジックはMCP facadeから分離します。`LandscapeMCPToolset`（facade）→ `LandscapeMCPOperations`（Validation・対象解決・読み書き）→ `LandscapeMCPTerrainAnalysis`（Landscape・UObject非依存の計算）の順に依存し、逆方向へ依存させません。傾斜・歩行可能性・領域集計の定義は`LandscapeMCPTerrainAnalysis`に1つだけ置き、後続機能から再利用します。
 
@@ -40,8 +40,22 @@ ProjectにBuild済みPluginと公式ToolsetRegistryを有効化し、隔離さ�
 
 MCP Serverを併用する場合は作業中Editorとportを分けます。index.jsonの成功数／失敗数と終了コードを確認してください。log・reportはGit管理外で保存します。
 
+## パッケージ
+
+配布用のパッケージは`RunUAT BuildPlugin`の出力から作ります。
+
+- `Config/FilterPlugin.ini`の指定により、出力には`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`、`Config/FilterPlugin.ini`が含まれます。
+- 出力の`Intermediate`は配布物に含めません。
+- `Binaries`の`.pdb`は配布物に含めません。Build時のローカルパスを含むためです。
+- 同じ理由で、配布用のBuildはユーザー名などを含まないパスで行います（`.dll`にも`.pdb`のパスが埋め込まれます）。
+- 配布物の中に`Saved`、ログ、検証の出力が入っていないことを確認します。
+
+名前の例: `LandscapeMCP-v<version>-UE<engine version>-Win64.zip`。展開すると`LandscapeMCP`フォルダが1つ現れ、そのまま`<Project>/Plugins/`へ置ける構成にします。
+
 ## Git / Release
 
-default branchは`main`、初版PRは`release/v0.1.0`→`main`。private repositoryで開始します。Build／Automation失敗、secret発見、意図しないコード差分ではCommit／Pushを停止します。
+default branchは`main`です。変更はbranchで行い、PRでレビューしてからMergeします。
 
-PRはユーザー確認後にMergeします。Merge前に`v0.1.0` Tag／Releaseを作成しません。Licenseの選定も権利者判断まで行いません。
+Build／Automationの失敗、secretの発見、意図しないコード差分がある場合は、Commit／Pushを止めます。Tool追加や挙動の変更では、既存のAutomation suiteをすべて再実行します。
+
+TagとGitHub Releaseは、PRのMerge後に作成します。

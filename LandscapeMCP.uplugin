@@ -5,6 +5,7 @@
   "FriendlyName": "Landscape MCP",
   "Description": "Bounded, transactional Landscape tools for the official UE ToolsetRegistry and MCP server.",
   "Category": "Editor",
+  "CreatedBy": "X-RAY-1",
   "EnabledByDefault": true,
   "CanContainContent": false,
   "EditorOnly": true,

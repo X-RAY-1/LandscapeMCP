@@ -1,33 +1,47 @@
 # LandscapeMCP
 
-Unreal Engine 5.8の公式Model Context ProtocolへLandscape操作を追加するEditor Pluginです。AI Agentが明示したLandscapeへ、小規模な作成・高度取得・Heightfield編集と、傾斜・領域高度・歩行可能性の読み取り評価を実行する基盤を提供します。
+Unreal EngineのLandscapeを、AI Agent / MCPクライアントから作成・編集・解析するためのEditor Toolsetです。
 
-独立MCP Serverは実装せず、`ToolsetRegistry` → `ModelContextProtocol` の公式機構へ追加Toolsetとして登録します。Toolset名は `LandscapeMCP.LandscapeMCPToolset`、Toolset Versionは `0.3`、Plugin descriptorの`VersionName`も`0.3`です。初版baselineは **v0.1.0**。v0.2で読み取り専用の地形評価Toolを3つ、v0.3で局所傾斜と領域の歩行可能性を評価するToolを2つ追加しました。既存Toolの入力schema・挙動・安全境界は変えていません。
+Unreal Engine 5.8の公式Model Context Protocol（`ToolsetRegistry` → `ModelContextProtocol`）へ、追加Toolsetとして登録されるEditor Pluginです。独立したMCP Serverは含みません。
 
-## 対応環境
+- Toolset名: `LandscapeMCP.LandscapeMCPToolset`
+- Toolset Version: `0.3`
+- 現在のリリース: v0.3.0（実験的。Plugin descriptorでも`IsExperimentalVersion`を指定しています）
 
-Freeze時点で確認した環境はUnreal Engine 5.8、Windows 11、Win64 Editorです。他のEngineバージョン・OS・Targetは未検証です。Runtime／Cooked向けModuleやContentは含みません。
+## 概要
+
+AI AgentがLandscapeを扱うときに必要な「作る → 編集する → 測る → 歩行可能性を評価する」の一連を、範囲と対象を限定したToolとして提供します。
+
+対象は明示された1つのLandscapeだけです。名前やラベルからの推測、対象がない場合の自動作成、保存は行いません。対応していない構成のLandscapeは、編集も読み取りも拒否します。対応範囲は[Limitations](#limitations)を先に確認してください。
+
+## 主な機能
+
+- **作成**: 読み込み済みのLevelへ、小規模で平坦なLandscapeを作成
+- **編集**: 円形範囲の盛り上げ・掘り下げ、平滑化、指定高度への平坦化。Dry-runとUndoに対応
+- **高さの取得**: 1点、または矩形領域をまとめて取得
+- **傾斜の解析**: 指定位置の代表的な傾斜と向き、周囲の実三角形から求めた局所的な最大・平均傾斜
+- **歩行可能性の評価**: 呼び出し側が渡した歩行可能角に対する、1点または領域のgeometry評価
 
 ## Tool一覧
 
-| Tool | 概要 |
-|---|---|
-| `CreateLandscape` | 指定した読み込み済みLevelへ平坦なLandscapeを作成 |
-| `GetHeight` | 指定World XYの元Heightfieldをbilinear補間して高度取得 |
-| `SculptRegion` | 円形範囲を盛り上げる／掘り下げる |
-| `SmoothRegion` | 円形範囲へ3x3近傍平均を1回適用 |
-| `FlattenRegion` | 円形範囲を指定World高度へ近づける |
-| `GetSlope` | 指定World XYの傾斜角・最大上昇方向・法線を取得（v0.2、読み取り専用） |
-| `GetHeightRegion` | 矩形領域の高度を格子でまとめて取得し、最小・最大・平均を集計（v0.2、読み取り専用） |
-| `EvaluateWalkability` | 指定した歩行可能角に対する傾斜の評価（v0.2、読み取り専用） |
-| `AnalyzeSlopeNeighborhood` | 中心傾斜と、周囲の実三角形から求めた局所最大・平均傾斜（v0.3、読み取り専用） |
-| `EvaluateWalkabilityRegion` | 矩形領域の実三角形を歩行可能角に対して一括評価（v0.3、読み取り専用） |
+| Tool | 種別 | 概要 |
+|---|---|---|
+| `CreateLandscape` | 書き込み | 指定した読み込み済みLevelへ平坦なLandscapeを作成 |
+| `GetHeight` | 読み取り | 指定World XYの高度を取得（元Heightfieldのbilinear補間） |
+| `SculptRegion` | 書き込み | 円形範囲を盛り上げる／掘り下げる |
+| `SmoothRegion` | 書き込み | 円形範囲へ3x3近傍平均を1回適用 |
+| `FlattenRegion` | 書き込み | 円形範囲を指定World高度へ近づける |
+| `GetSlope` | 読み取り | 指定World XYの傾斜角・最大上昇方向・法線を取得 |
+| `GetHeightRegion` | 読み取り | 矩形領域の高度を格子で取得し、最小・最大・平均と最大傾斜を集計 |
+| `EvaluateWalkability` | 読み取り | 指定位置の傾斜を、渡された歩行可能角と比較 |
+| `AnalyzeSlopeNeighborhood` | 読み取り | 中心傾斜と、周囲の実三角形から求めた局所最大・平均傾斜 |
+| `EvaluateWalkabilityRegion` | 読み取り | 矩形領域の実三角形を、渡された歩行可能角に対して一括評価 |
 
-入力・出力・単位は[Tool仕様](docs/tools.md)を参照してください。
+入力・出力・単位・計算式は[Tool仕様](docs/tools.md)にあります。距離・高さ・座標はワールドcm、角度は度です。
 
 ### 中心傾斜と局所最大傾斜
 
-傾斜には2種類の値があります。用途が違うので使い分けてください。
+傾斜には2種類の値があり、用途が違います。
 
 | 値 | 求め方 | 向いている用途 | 弱点 |
 |---|---|---|---|
@@ -36,84 +50,197 @@ Freeze時点で確認した環境はUnreal Engine 5.8、Windows 11、Win64 Edito
 
 歩けるかどうかを見るときは、中心傾斜だけで判断せず、`AnalyzeSlopeNeighborhood`か`EvaluateWalkabilityRegion`で周囲の実三角形も確認してください。
 
+## Requirements
 
-## 安全設計
+Tested:
 
-- 書き込みToolの`bDryRun`は既定`true`。Validationと変更計画だけを実行します。
-- 対象は完全Object Pathで指定し、名前やラベルから推測しません。
-- 数値・範囲・対象構成を検証し、非対応構成は明示的にFAILします。
-- Editor game thread限定。PIE、Save、GC中は読み取りも拒否します。
-- 実編集はTransaction／Undo対応で、結果照合失敗時はUndo rollbackを試みます。
-- 評価Tool（`GetSlope`／`GetHeightRegion`／`EvaluateWalkability`／`AnalyzeSlopeNeighborhood`／`EvaluateWalkabilityRegion`）は読み取り専用で、Transaction・Modify・Package dirty化を行いません。計測点や矩形がLandscape外にかかる場合はclipせずFAILします（`AnalyzeSlopeNeighborhood`の半径だけは端で切り、`bClipped`で知らせます）。
-- `EvaluateWalkability`と`EvaluateWalkabilityRegion`はLandscape形状の評価です。歩行可能角は呼び出し側が渡し、CharacterやBlueprintを参照しません。
-- 保存・Autosave APIを呼びません。Editorの独立Autosaveは別途管理してください。実編集によるPackage dirty化は行われます。
+- Unreal Engine 5.8 / Windows 64-bit（Win64 Editor）
 
-詳細は[安全境界](docs/safety.md)を参照してください。
+必要なもの:
 
-## インストール
+- Unreal Engine 5.8のEditor。本PluginはEditor専用で、Runtime／Cooked向けのModuleやContentは含みません
+- Unreal Engine側のModel Context Protocol環境。公式Pluginの`ToolsetRegistry`（本Pluginのdescriptorが依存を宣言）と`ModelContextProtocol`（MCPとして公開するために必要）
+- ソースからBuildする場合は、UE5.8に対応したWin64のC++ Build環境
 
-1. Editorを終了してから、本リポジトリをProjectの`Plugins/LandscapeMCP`へ配置します。
-2. Projectで公式`ToolsetRegistry`と`ModelContextProtocol`を有効にします。descriptorは`ToolsetRegistry`依存を宣言し、MCP公開には別途`ModelContextProtocol`が必要です。
-3. UE5.8と対応C++ Build環境でPluginをBuildします。BinariesはGit管理していません。
-4. Editorを起動し、MCP Clientから`list_toolsets`／`describe_toolset`で検出します。All ToolsetsまたはLandscapeMCP Toolsetを有効にしてください。
+他のEngineバージョン、OS、Targetは検証していません。動作は保証しません。
 
-追加MCP Server、PCG、Modeling、Scriptable Toolsは本Pluginの依存ではありません。Build Module依存はCore、CoreUObject、Engine、ToolsetRegistry、Landscape、UnrealEd、Foliage、RenderCore、Json、JsonUtilitiesです。
+Build Moduleの依存はCore、CoreUObject、Engine、ToolsetRegistry、Landscape、UnrealEd、Foliage、RenderCore、Json、JsonUtilitiesで、すべてEngine付属です。第三者ライブラリは含みません。
 
-Build・Automationの手順は[開発手順](docs/development.md)を参照してください。
+## Installation
 
-## 使用例
+配置先はどの方法でも同じです。
 
-公式`call_tool`を使用します。まず新規の未保存・非World Partition Levelを開き、完全ULevel Object Pathを取得します。以下のパスは例なので実際の値へ置き換えてください。
+```
+<Project>/Plugins/LandscapeMCP/
+├── LandscapeMCP.uplugin
+├── Source/
+└── Binaries/        （Build済みの場合）
+```
+
+### A. Build済みパッケージを使う
+
+1. Unreal Editorを終了します。
+2. パッケージを展開し、`LandscapeMCP`フォルダを`<Project>/Plugins/`へ置きます。
+3. Editorを起動します。
+
+パッケージのBinariesは、Unreal Engine 5.8 / Win64向けにBuildしたものです。Engineのビルドが一致しない場合は読み込めないので、Bの手順でBuildしてください。
+
+### B. ソース（clone / download）からBuildする
+
+1. このリポジトリをcloneまたはdownloadします。
+2. `RunUAT BuildPlugin`でBuildします。出力先には、リポジトリの外の新しいフォルダを指定します。
+
+   ```powershell
+   & '<UE_ROOT>/Engine/Build/BatchFiles/RunUAT.bat' BuildPlugin `
+     '-Plugin=<REPO_ROOT>/LandscapeMCP.uplugin' `
+     '-Package=<NEW_PACKAGE_DIR>' -TargetPlatforms=Win64 -NoP4
+   ```
+
+3. Unreal Editorを終了し、出力フォルダの中身（`Intermediate`を除く）を`<Project>/Plugins/LandscapeMCP/`へ置きます。
+4. Editorを起動します。
+
+リポジトリにBinariesは含まれていません。C++ Projectであれば、`Plugins/LandscapeMCP`へソースを置いてProjectと一緒にBuildする通常の方法も使えるはずですが、この方法は検証していません。
+
+### Pluginの有効化と検出の確認
+
+1. Projectで公式Pluginの`ModelContextProtocol`を有効にします。`ToolsetRegistry`は本Pluginの依存として有効になります。
+2. Model Context Protocol側で、All ToolsetsまたはLandscapeMCPのToolsetを有効にします。
+3. MCPクライアントをEditorのMCP Serverへ接続します。接続先はModel Context Protocol Pluginの設定に従ってください。検証環境では`http://127.0.0.1:8000/mcp`（HTTP）でした。
+4. `list_toolsets`に`LandscapeMCP.LandscapeMCPToolset`が現れ、`describe_toolset`でVersion `0.3`と10 Toolが返ることを確認します。
+
+PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存ではありません。
+
+## MCPからの利用方法
+
+公式MCP Serverが公開するのは`list_toolsets`、`describe_toolset`、`call_tool`の3つです。本PluginのToolは、`call_tool`に`toolset_name`と`tool_name`を指定して呼び出します。
 
 ```json
 {
   "name": "call_tool",
   "arguments": {
     "toolset_name": "LandscapeMCP.LandscapeMCPToolset",
-    "tool_name": "CreateLandscape",
+    "tool_name": "GetHeight",
     "arguments": {
-      "levelPath": "/Temp/Untitled_1.Untitled:PersistentLevel",
-      "landscapeName": "AI_LandscapeTest",
-      "location": {"x": 0, "y": 0, "z": 0},
-      "scale": {"x": 100, "y": 100, "z": 100},
-      "componentCountX": 1, "componentCountY": 1,
-      "sectionsPerComponent": 1, "quadsPerSection": 63,
-      "initialWorldHeight": 0, "bDryRun": true
+      "landscapePath": "/Temp/Untitled_1.Untitled:PersistentLevel.AI_LandscapeTest",
+      "worldX": 3150,
+      "worldY": 3150
     }
   }
 }
 ```
 
-Validation成功後だけ同じ入力で`bDryRun:false`として実行し、返された`landscapePath`を次の`SculptRegion`と`GetHeight`へ渡します。`SculptRegion`もdry-runを先に実行してください。
+以下の例では、`arguments`の中身だけを示します。パスは例なので、実際の値へ置き換えてください。
+
+### 例: 作る → 編集する → 測る → 歩行可能性を評価する
+
+前提として、World Partitionを使わないLevelをEditorで開き、そのULevelの完全Object Pathを用意します。
+
+**1. 作る（`CreateLandscape`）**
+
+まずDry-runで検証します。
 
 ```json
-{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_LandscapeTest","center":{"x":3150,"y":3150},"radiusCm":800,"strengthCm":100,"falloff":1,"bRaise":true,"bDryRun":true}
+{"levelPath":"/Temp/Untitled_1.Untitled:PersistentLevel","landscapeName":"AI_LandscapeTest","location":{"x":0,"y":0,"z":0},"scale":{"x":100,"y":100,"z":100},"componentCountX":1,"componentCountY":1,"sectionsPerComponent":1,"quadsPerSection":63,"initialWorldHeight":0,"bDryRun":true}
 ```
+
+成功したら、同じ入力を`"bDryRun":false`にして実行します。64×64 Sample、63m四方の平坦なLandscapeができます。返された`landscapePath`を以降のToolへ渡します。
+
+**2. 編集する（`SculptRegion`）**
+
+丘を作ります。これもDry-runで変更量を確認してから、`"bDryRun":false`で実行します。
 
 ```json
-{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_LandscapeTest","worldX":3150,"worldY":3150}
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_LandscapeTest","center":{"x":3000,"y":3000},"radiusCm":600,"strengthCm":600,"falloff":1,"bRaise":true,"bDryRun":true}
 ```
 
-編集後の斜面は、歩行させる前に評価できます。`walkableFloorAngleDeg`には対象CharacterのWalkable Floor Angleを呼び出し側で調べて渡します。
+**3. 測る（`GetSlope`、`AnalyzeSlopeNeighborhood`）**
+
+丘の斜面の傾斜と向きを取得します。
 
 ```json
-{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_LandscapeTest","worldX":2700,"worldY":3150,"walkableFloorAngleDeg":44.77,"sampleDistanceCm":100}
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_LandscapeTest","worldX":3300,"worldY":3000,"sampleDistanceCm":100}
 ```
 
-エラー時は依存する後続処理を停止します。UndoはEditorの既存Undoを使用します。
+丘の頂点では`GetSlope`が0度になります（両側の斜面が打ち消し合うため）。周囲の急な面は`AnalyzeSlopeNeighborhood`で確認します。
 
-## 既知の制限
+```json
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_LandscapeTest","worldX":3000,"worldY":3000,"radiusCm":300,"sampleDistanceCm":100}
+```
 
-World Partition、Landscape Streaming Proxy、複雑なEdit Layer、Nanite Landscape、付属Foliage、Visibility Holeに非対応です。path探索、path brush／rectangle brush、不可歩行領域の自動Smoothは未実装です。歩行可能性の評価Toolは、CharacterMovementの完全な再現ではありません。[制限一覧](docs/limitations.md)を参照してください。
+この例では`centerSlopeDegrees`が0、`localMaxSlopeDegrees`が約58度になります。
 
-## Unreal MCP側の既知事項
+**4. 歩行可能性を評価する（`EvaluateWalkabilityRegion`）**
 
-公式`StartPIE`が`PIE ended before warmup completed.`を返しながら、PIE自体が開始しているケースを確認しています。**LandscapeMCPの既知不具合とは分類していません。** 起動Toolを無条件retryせず、`IsPIERunning`、PIE World、PlayerController、Characterの状態を照合してください。LandscapeMCPの10 ToolはPIE中に使用できません。
+丘を含む一帯を、歩行可能角44.77度で評価します。`walkableFloorAngleDeg`には、対象CharacterのWalkable Floor Angleを呼び出し側で調べて渡します。
 
-## 検証
+```json
+{"landscapePath":"/Temp/Untitled_1.Untitled:PersistentLevel.AI_LandscapeTest","minX":2400,"minY":2400,"maxX":3600,"maxY":3600,"walkableFloorAngleDeg":44.77}
+```
 
-Freeze判定は **`LandscapeMCP v0.1: FREEZE CANDIDATE`**。Automation、MCP編集E2E、通常入力のGoal完走、Boundary往復、急斜面の正常な阻止と逆入力復帰を確認しました。[検証要約](docs/testing.md)に範囲・数値・外部制約を記録しています。v0.2・v0.3で追加したToolのBuild・Automation・簡易MCP E2Eの結果も同じ文書に記録しています。Characterの実走行による確認は別途行います。
+この例では`classification`が`MIXED`になり、`walkableCount`／`unwalkableCount`／`worstLocation`から、どこが急すぎるかが分かります。結果を見て`SmoothRegion`や`FlattenRegion`で直し、もう一度評価する、という使い方を想定しています。
+
+### 呼び出しの原則
+
+- 書き込みToolは、Dry-runで結果を確認してから本実行します。
+- エラーが返ったら、それに依存する後続の処理を止めます。別の対象を推測して続行しないでください。
+- 編集の取り消しには、Editorの通常のUndoを使います。
+- PIE中は10 Toolすべてが使えません。
+
+## Safety design
+
+誤った対象を編集しないこと、気付かないうちに状態を変えないことを優先した設計です。ただし、これは被害の範囲を限定するための仕組みで、結果の正しさを保証するものではありません。
+
+- **完全Object Path**: 対象は読み込み済みActor／Levelの完全Object Pathで指定します。名前やラベルから推測しません。
+- **Dry-run**: 書き込みToolの`bDryRun`は既定で`true`です。Dry-runは同じValidationと変更計画を実行し、Heightfield・Package・Undo履歴を変更しません。
+- **Undo**: 実編集はTransactionとして記録され、EditorのUndoで戻せます。書き込み後の照合に失敗した場合は、Undoによるrollbackを試みます。
+- **保存しない**: 保存・Autosave APIを呼びません。ただし実編集はPackageをdirtyにします。Editor自身のAutosaveは本Pluginの管理外です。
+- **read-onlyの分析Tool**: `GetHeight`、`GetSlope`、`GetHeightRegion`、`EvaluateWalkability`、`AnalyzeSlopeNeighborhood`、`EvaluateWalkabilityRegion`は、Transaction・Modify・Package dirty化を行いません。
+- **PIE / Save / GC中は拒否**: Editorのgame thread上、現在のEditor Worldだけを対象とし、PIE中・Package保存中・GC中は読み取りも拒否します。
+- **fail-closed**: 入力や対象が不明・不正な場合は実行せずにFAILします。NaN／Infinity、範囲外、逆転した範囲を拒否します。
+- **Sample上限**: 作成は262144 Sample、編集は16384 Sample、領域の高さ取得は1024 Sample、実三角形の解析は16384頂点まで。半径・強さ・距離にも上限があります。
+- **非対応のLandscapeは拒否**: 下の[Limitations](#limitations)にある構成は、編集だけでなく読み取りも拒否します。
+
+詳細は[安全境界](docs/safety.md)にあります。
+
+## Limitations
+
+- **対応していない構成**: World Partition、external actorを使うLevel、Landscape Streaming Proxy、複数または特殊なEdit Layer、Blueprint brush、Nanite Landscape、回転したLandscape、付属Foliage、Visibility Holeには対応していません。これらはFAILします。
+- **CharacterMovementの完全な再現ではない**: 歩行可能性の評価は、Landscape形状の傾斜と、渡された歩行可能角の比較だけです。Capsule、Step Height、Perch、速度などは扱いません。`WALKABLE`は実際に歩けることを、`UNWALKABLE`は実際に進めないことを保証しません。
+- **`NEAR_LIMIT`は量子化誤差だけ**: `NEAR_LIMIT`と`slopeUncertaintyDegrees`は、高さの16-bit量子化に対する測定上の区分です。Collisionとの差やCharacter側の要因による不確実性は含みません。
+- **Collision LOD / Simple Collision Mipは考慮しない**: 実三角形の解析はHeightfieldの解像度で行います。Collisionの解像度を粗くしたLandscapeでは、実際の接触面と一致しません。
+- **三角形分割はUE5.8で検証**: セルを対角線00-11で分割する前提は、UE5.8のEngineソースとCollisionのline traceで確認したものです。同じ確認をAutomationに入れています。
+- **別のUEバージョンは未検証**: UE5.8 / Win64 Editor以外では検証していません。
+- **高さはCollisionそのものではない**: `GetHeight`などの高さは元Heightfieldのbilinear補間で、Collisionの面とは最大で数十cmずれる場合があります（格子内で高さが大きくねじれたセル）。
+- **中心傾斜は対称な地形で0になる**: 上の[中心傾斜と局所最大傾斜](#中心傾斜と局所最大傾斜)を参照してください。
+- **未実装**: 経路探索、path／rectangle brush、不可歩行領域の自動修正はありません。
+
+全体は[制限一覧](docs/limitations.md)にあります。
+
+### Unreal Engine側のMCPについての既知事項
+
+公式の`StartPIE` Toolが`PIE ended before warmup completed.`というエラーを返しながら、PIE自体は開始しているケースを確認しています。本Pluginの不具合ではありませんが、併用する場合は起動Toolを無条件に再実行せず、`IsPIERunning`などで状態を確認してください。
+
+## Development / Testing
+
+- [開発手順](docs/development.md): 構成、Build、Automationの実行方法、パッケージの作り方
+- [検証要約](docs/testing.md): これまでに行った検証の範囲と結果
+
+Automation Testは3つのsuiteがあります。
+
+| suite | 対象 |
+|---|---|
+| `LandscapeMCP.V01.SafetyAndOperations` | 作成・編集・Dry-run・Undo・Validation・非対応構成の拒否 |
+| `LandscapeMCP.V02.TerrainAnalysis` | 傾斜・領域の高さ・歩行可能性・量子化誤差の上限・read-only |
+| `LandscapeMCP.V03.TerrainHardening` | 実三角形・近傍解析・領域の歩行可能性・Collisionの三角形分割の確認 |
+
+Automationは新しい未保存Mapを作り、Undo履歴も使います。作業中のEditorではなく、検証用の別Projectで実行してください。
+
+検証はAutomationと、MCP経由の簡易E2Eが中心です。Characterを実際に走らせた検証はv0.1の範囲で行ったもので、v0.2以降の解析Toolの結果と実走行の対応は、利用する環境で確認してください。
 
 ## License
 
-Licenseは未指定です。このリポジトリは独自のLICENSEをまだ付与していません。利用・配布条件は権利者の判断が必要です。Unreal Engineと公式Pluginの利用条件は各提供元の規約に従います。
+Licensed under the Apache License 2.0. 全文は[LICENSE](LICENSE)にあります。
+
+Copyright 2026 X-RAY-1
+
+Unreal Engineおよび公式Pluginは本リポジトリに含まれず、それぞれの提供元の規約に従います。

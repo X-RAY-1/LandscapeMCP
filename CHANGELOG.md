@@ -1,8 +1,29 @@
 # Changelog
 
-## v0.3.0 — 未リリース（レビュー前）
+## v0.3.0 — 2026-10-06
 
-地形評価の局所性と、歩行可能性評価の実用性を強化。`feature/v0.3-terrain-analysis-hardening`で作業中で、`main`へは未Mergeです。
+最初のPublic Release。Apache License 2.0で公開します。
+
+このリリースで揃っているもの:
+
+- **Landscapeの作成と編集**: `CreateLandscape`、`SculptRegion`、`SmoothRegion`、`FlattenRegion`
+- **地形の解析**: `GetHeight`、`GetHeightRegion`（矩形領域の高さと集計）
+- **傾斜と近傍の解析**: `GetSlope`（中心傾斜）、`AnalyzeSlopeNeighborhood`（周囲の実三角形の局所最大・平均傾斜）
+- **歩行可能性の評価**: `EvaluateWalkability`（1点）、`EvaluateWalkabilityRegion`（領域）。歩行可能角は呼び出し側が渡すgeometry評価
+- **Safety**: 完全Object Pathによる対象指定、書き込みToolのDry-run（既定）、Transaction／Undo、保存APIを呼ばない、解析Toolはread-only、PIE／Save／GC中の拒否、Sample上限、非対応Landscapeの拒否
+- **Automation**: `LandscapeMCP.V01.SafetyAndOperations`、`LandscapeMCP.V02.TerrainAnalysis`、`LandscapeMCP.V03.TerrainHardening`
+
+検証済みの環境はUnreal Engine 5.8 / Windows 64-bitです。制限は`docs/limitations.md`を参照してください。
+
+公開準備での変更（機能の変更なし）:
+
+- `LICENSE`（Apache License 2.0）を追加
+- READMEを公開利用者向けに再構成（Requirements、Installation、MCPからの利用方法、Safety design、Limitations）
+- Build済みパッケージへ`LICENSE`、`README.md`、`CHANGELOG.md`、`docs`を含めるよう`Config/FilterPlugin.ini`を設定
+- Plugin descriptorへ`CreatedBy`を追加
+- docsから公開前の運用メモを整理
+
+v0.2からの機能追加:
 
 - AnalyzeSlopeNeighborhood追加: 中心傾斜（GetSlopeと同じ中心差分）と、周囲のLandscape実三角形から求めた局所最大・平均傾斜を返す。頂点・尾根・谷底・鞍部のように中心傾斜が0になる場所でも、周囲の急斜面を検出できる
 - EvaluateWalkabilityRegion追加: 矩形領域の実三角形を歩行可能角に対して一括評価し、WALKABLE / NEAR_LIMIT / UNWALKABLEの数、比率、最大傾斜、最悪の位置、領域の分類（WALKABLE / MIXED / UNWALKABLE）を返す
