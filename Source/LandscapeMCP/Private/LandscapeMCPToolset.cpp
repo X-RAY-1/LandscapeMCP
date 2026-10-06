@@ -4,7 +4,8 @@
 
 namespace
 {
-    FLandscapeMCPResult Publish(FLandscapeMCPResult Result)
+    template <typename TResult>
+    TResult Publish(TResult Result)
     {
         if (!Result.bSuccess) { UKismetSystemLibrary::RaiseScriptError(TEXT("LandscapeMCP: ") + Result.Message); }
         return Result;
@@ -50,4 +51,21 @@ FLandscapeMCPResult ULandscapeMCPToolset::FlattenRegion(const FString& Landscape
     R.Strength = Strength; R.Falloff = Falloff; R.TargetHeightCm = TargetHeightCm;
     R.bDryRun = bDryRun; R.Operation = LandscapeMCP::EOperation::Flatten;
     return Publish(LandscapeMCP::Edit(R));
+}
+
+FLandscapeMCPSlopeResult ULandscapeMCPToolset::GetSlope(const FString& LandscapePath, double WorldX, double WorldY, double SampleDistanceCm)
+{
+    return Publish(LandscapeMCP::Slope(LandscapePath, WorldX, WorldY, SampleDistanceCm));
+}
+
+FLandscapeMCPHeightRegionResult ULandscapeMCPToolset::GetHeightRegion(const FString& LandscapePath, double MinX, double MinY,
+    double MaxX, double MaxY, double SampleSpacingCm)
+{
+    return Publish(LandscapeMCP::HeightRegion(LandscapePath, MinX, MinY, MaxX, MaxY, SampleSpacingCm));
+}
+
+FLandscapeMCPWalkabilityResult ULandscapeMCPToolset::EvaluateWalkability(const FString& LandscapePath, double WorldX, double WorldY,
+    double WalkableFloorAngleDeg, double SampleDistanceCm)
+{
+    return Publish(LandscapeMCP::Walkability(LandscapePath, WorldX, WorldY, WalkableFloorAngleDeg, SampleDistanceCm));
 }
