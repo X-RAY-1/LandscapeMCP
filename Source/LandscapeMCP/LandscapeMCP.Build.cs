@@ -6,6 +6,6 @@ public class LandscapeMCP : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "ToolsetRegistry" });
-        PrivateDependencyModuleNames.AddRange(new[] { "Landscape", "UnrealEd", "Foliage", "RenderCore", "Json", "JsonUtilities" });
+        PrivateDependencyModuleNames.AddRange(new[] { "Landscape", "UnrealEd", "Foliage", "RenderCore", "Json", "JsonUtilities", "SourceControl", "Chaos", "PhysicsCore" });
     }
 }

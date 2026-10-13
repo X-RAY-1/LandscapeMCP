@@ -1,6 +1,8 @@
 #include "LandscapeMCPToolset.h"
 #include "LandscapeMCPOperations.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "LandscapeMCPTerrainPlanning.h"
+#include "LandscapeMCPApply.h"
 
 namespace
 {
@@ -10,6 +12,45 @@ namespace
         if (!Result.bSuccess) { UKismetSystemLibrary::RaiseScriptError(TEXT("LandscapeMCP: ") + Result.Message); }
         return Result;
     }
+}
+
+namespace
+{
+    // adapterは変更しない。失敗時はprofile配列を含めないbounded診断だけを公開する。
+    // stageはExecuteが報告した処理段階であり、message文字列からは決めない。
+    FLandscapeMCPTerrainOperationResult RunTerrainOperation(const LandscapeMCP::Authoring::FPreviewRequest& Request)
+    {
+        FString Stage;
+        FLandscapeMCPTerrainOperationResult Result=LandscapeMCP::Authoring::Execute(Request,&Stage);
+        if(!Result.bSuccess)
+        { UKismetSystemLibrary::RaiseScriptError(TEXT("LandscapeMCP: ")+LandscapeMCP::Authoring::FormatFailureDiagnostic(Result,Stage)); }
+        return Result;
+    }
+}
+
+FLandscapeMCPTerrainOperationResult ULandscapeMCPToolset::FlattenPath(const FString& LandscapePath,const TArray<FVector2D>& Points,
+    double WidthCm,double FalloffCm,const FString& HeightMode,double TargetHeightCm,double MaxDeltaCm,bool bDryRun)
+{
+    LandscapeMCP::Authoring::FPreviewRequest R;R.LandscapePath=LandscapePath;R.Points=Points;R.Width=WidthCm;
+    R.Falloff=FalloffCm;R.HeightMode=HeightMode;R.TargetHeight=TargetHeightCm;R.MaxDelta=MaxDeltaCm;R.bDryRun=bDryRun;
+    return RunTerrainOperation(R);
+}
+
+FLandscapeMCPTerrainOperationResult ULandscapeMCPToolset::FlattenRectangle(const FString& LandscapePath,FVector2D Center,
+    double SizeXCm,double SizeYCm,double TargetHeightCm,double FalloffCm,double MaxDeltaCm,double YawDegrees,bool bDryRun)
+{
+    LandscapeMCP::Authoring::FPreviewRequest R;R.Operation=LandscapeMCP::Authoring::EAuthoringOperation::FlattenRectangle;
+    R.LandscapePath=LandscapePath;R.Center=Center;R.SizeX=SizeXCm;R.SizeY=SizeYCm;R.TargetHeight=TargetHeightCm;
+    R.Falloff=FalloffCm;R.MaxDelta=MaxDeltaCm;R.Yaw=YawDegrees;R.bDryRun=bDryRun;
+    return RunTerrainOperation(R);
+}
+
+FLandscapeMCPTerrainOperationResult ULandscapeMCPToolset::CreateWalkablePath(const FString& LandscapePath,const TArray<FVector2D>& Points,
+    double WidthCm,double FalloffCm,double MaxSlopeDegrees,double MaxDeltaCm,bool bDryRun)
+{
+    LandscapeMCP::Authoring::FPreviewRequest R;R.Operation=LandscapeMCP::Authoring::EAuthoringOperation::CreateWalkablePath;
+    R.LandscapePath=LandscapePath;R.Points=Points;R.Width=WidthCm;R.Falloff=FalloffCm;R.MaxSlope=MaxSlopeDegrees;R.MaxDelta=MaxDeltaCm;R.bDryRun=bDryRun;
+    return RunTerrainOperation(R);
 }
 
 FLandscapeMCPResult ULandscapeMCPToolset::CreateLandscape(const FString& LevelPath, const FString& LandscapeName,

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "ToolsetRegistry/ToolsetDefinition.h"
+#include "LandscapeMCPTerrainOperationResult.h"
 #include "LandscapeMCPToolset.generated.h"
 
 /** 高さと距離の数値はワールド座標のcm。Dry-runではTransactionを開始しない。 */
@@ -76,7 +77,7 @@ struct LANDSCAPEMCP_API FLandscapeMCPHeightRegionResult
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector MaxSlopeLocation = FVector::ZeroVector;
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") TArray<double> HeightsCm;
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightQuantizationCm = 0;
-    /** v0.3: 矩形に重なるLandscapeの実三角形(対角線00-11で分割)の最大傾斜。SampleSpacingCmに依存しない。 */
+    /** 矩形に重なるLandscapeの実三角形(対角線00-11で分割)の最大傾斜。SampleSpacingCmに依存しない。 */
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bTriangleSlopeValid = false;
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double MaxTriangleSlopeDegrees = 0;
     /** 最大傾斜の三角形の重心。Zは3頂点の平均高度。 */
@@ -182,13 +183,41 @@ struct LANDSCAPEMCP_API FLandscapeMCPWalkabilityResult
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightCenterCm = 0;
 };
 
-/** v0.3: Editor限定。World Partition非使用で、表示・ロック解除済みの標準Edit Layerが1つあるLandscapeのみ対応。保存しない。 */
+/** Editor限定。World Partition非使用で、表示・ロック解除済みの標準Edit Layerが1つあるLandscapeのみ対応。保存しない。 */
 UCLASS()
 class LANDSCAPEMCP_API ULandscapeMCPToolset : public UToolsetDefinition
 {
     GENERATED_BODY()
 public:
-    virtual FString GetToolsetVersion() const override { return TEXT("0.3"); }
+    virtual FString GetToolsetVersion() const override { return TEXT("0.4"); }
+
+    /** Polylineに沿う帯状領域を平坦化する。widthCmはcoreの全幅、falloffCmはcore外のblend距離。
+     * bDryRun=true（既定）は解析とPreviewのみで、地形へ書き込まない。bDryRun=falseは検証後にLandscapeの高さを実際に変更する（1 transaction、Undo可能、Levelは自動保存しない）。
+     * Preview成功はApplyの受理を保証しない。Applyは追加の実行時安全検査を行い、未対応のLandscape/Editor状態は書き込み前に拒否し、書き込み後の検証に失敗した変更はrollbackする（fail closed）。
+     * heightMode=fixedはtargetHeightCmを使用。follow_startはsnapshot始点高度、follow_pathはsnapshotの各knot高度を弧長線形補間する。
+     * targetHeightCmはschema上required。non-fixedではfiniteの値を受け取るが使用しない。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPTerrainOperationResult FlattenPath(const FString& LandscapePath, const TArray<FVector2D>& Points,
+        double WidthCm, double FalloffCm, const FString& HeightMode, double TargetHeightCm, double MaxDeltaCm, bool bDryRun = true);
+
+    /** 軸平行矩形を目標高度へ平坦化する。YawDegreesは0のみ。targetHeightCmは絶対World Z cm、falloffCmは矩形外のblend距離。
+     * bDryRun=true（既定）は解析とPreviewのみで、地形へ書き込まない。bDryRun=falseは検証後にLandscapeの高さを実際に変更する（1 transaction、Undo可能、Levelは自動保存しない）。
+     * Preview成功はApplyの受理を保証しない。Applyは追加の実行時安全検査を行い、未対応のLandscape/Editor状態は書き込み前に拒否し、書き込み後の検証に失敗した変更はrollbackする（fail closed）。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPTerrainOperationResult FlattenRectangle(const FString& LandscapePath, FVector2D Center,
+        double SizeXCm, double SizeYCm, double TargetHeightCm, double FalloffCm, double MaxDeltaCm, double YawDegrees = 0, bool bDryRun = true);
+
+    /** 入力Polylineの端点高度を固定し、MaxSlopeDegrees以下の安全なprofileを計画して帯状に整地する。経路探索はしない。
+     * bDryRun=true（既定）は解析とPreviewのみで、地形へ書き込まない。bDryRun=falseは検証後にLandscapeの高さを実際に変更する（1 transaction、Undo可能、Levelは自動保存しない）。
+     * Preview成功はApplyの受理を保証しない。Applyは追加の実行時安全検査を行い、未対応のLandscape/Editor状態は書き込み前に拒否し、書き込み後の検証に失敗した変更はrollbackする（fail closed）。
+     * MaxSlopeDegreesは(0,60]。量子化後coreの実三角形全枚がWALKABLEであることを要求し、NEAR_LIMITは拒否。
+     * sampling intervalはgrid scaleから内部算出。Applyはsource geometryとLandscape collisionを検証するが、CharacterやNavMeshの通行は保証しない。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPTerrainOperationResult CreateWalkablePath(const FString& LandscapePath, const TArray<FVector2D>& Points,
+        double WidthCm, double FalloffCm, double MaxSlopeDegrees, double MaxDeltaCm, bool bDryRun = true);
 
     /** 明示指定された読み込み済みEditor LevelにLandscapeを作成する。LocationはXY最小隅。
      * Scaleはグリッド座標単位あたりのcm。推奨値は(100,100,100)。InitialWorldHeightは絶対ワールドZのcm。
