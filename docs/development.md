@@ -36,7 +36,14 @@ ProjectにBuild済みPluginと公式ToolsetRegistryを有効化し、隔離さ�
   '-TestExit=Automation Test Queue Empty' '-ReportExportPath=<REPORT_DIR>'
 ```
 
-`LandscapeMCP`を指定すると、v0.1の`LandscapeMCP.V01.SafetyAndOperations`、v0.2の`LandscapeMCP.V02.TerrainAnalysis`、v0.3の`LandscapeMCP.V03.TerrainHardening`をすべて実行します。機能追加時は既存suiteも必ず再実行してください。
+`LandscapeMCP`を指定すると、60 suiteすべて（`LandscapeMCP.V01.SafetyAndOperations`、`LandscapeMCP.V02.TerrainAnalysis`、`LandscapeMCP.V03.TerrainHardening`、`LandscapeMCP.V04.*`の57 suite）を実行します。機能追加時は既存suiteも必ず再実行してください。
+
+v0.4のsuiteには次の前提があります。
+
+- **Pluginの配置**: `LandscapeMCP.V04.OfficialSchema13Tools`は、`<Project>/Plugins/LandscapeMCP/Source/LandscapeMCP/Private/Tests/Fixtures/LandscapeMCP_v030_schema.json`を読みます。PluginをProjectの`Plugins/LandscapeMCP`へソースごと置いてください。
+- **Editorの設定**: Applyを含むsuiteは、Autosaveと自動checkoutが無効で、Source Controlのproviderが有効でないEditorを必要とします。上のコマンドに`'-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.EditorLoadingSavingSettings]:bAutomaticallyCheckoutOnAssetModification=False'`を足してください。
+- **MCPの往復**: `LandscapeMCP.V04.MCP.TransportRoundTrip`は、`-LandscapeMCPTransportHarness=<空のdirectory>`を指定し、外部のHTTP clientがそのdirectoryの`ready<N>.json`を待って`done<N>`を書く形で連携したときだけMCPの往復を検証します。指定しない場合は警告を1件出して終了し、MCPの往復は検証しません。Projectでは公式Pluginの`ModelContextProtocol`も有効にします。
+- fault注入のsuiteは、検証用の地形で意図的にrollbackとlatchを起こします。作業中のProjectでは実行しないでください。
 
 MCP Serverを併用する場合は作業中Editorとportを分けます。index.jsonの成功数／失敗数と終了コードを確認してください。log・reportはGit管理外で保存します。
 
