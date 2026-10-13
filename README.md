@@ -163,7 +163,7 @@ Build Moduleの依存はCore、CoreUObject、Engine、ToolsetRegistry、Landscap
    ```
 
 3. Unreal Editorを終了し、出力フォルダの中身（`Intermediate`を除く）を`<Project>/Plugins/LandscapeMCP/`へ置きます。
-4. Editorを起動します。
+4. Unreal Engine 5.8でProjectを開き、下の「Pluginの有効化と検出の確認」の手順でPluginを有効にします。
 
 `<Project>/Plugins/LandscapeMCP/`へソースを置き、Projectを対象にUnrealBuildToolでPluginをBuildする方法も使えます。
 
@@ -171,10 +171,15 @@ BuildしたBinariesは、Buildに使ったEngineでだけ読み込めます。En
 
 ### Pluginの有効化と検出の確認
 
-1. Projectで公式Pluginの`ModelContextProtocol`を有効にします。`ToolsetRegistry`は本Pluginの依存として有効になります。
-2. Model Context Protocol側で、All ToolsetsまたはLandscapeMCPのToolsetを有効にします。
-3. MCPクライアントをEditorのMCP Serverへ接続します。接続先はModel Context Protocol Pluginの設定に従ってください。検証環境では`http://127.0.0.1:8000/mcp`（HTTP）でした。
-4. `list_toolsets`に`LandscapeMCP.LandscapeMCPToolset`が現れ、`describe_toolset`でVersion `0.4`と13 Toolが返ることを確認します。
+1. `<Project>/Plugins/LandscapeMCP/`にPluginが置かれていることを確認し、Unreal Engine 5.8でProjectを開きます。
+2. Edit → Pluginsを開き、`Landscape MCP`を検索して有効にします。配置しただけでは有効になりません。`RunUAT BuildPlugin`の出力では、descriptorの`EnabledByDefault`が保持されないためです。ソースを直接置いた場合も、ここで有効になっていることを確認してください。
+3. 同じ画面で、公式Pluginの`ModelContextProtocol`を有効にします。`ToolsetRegistry`は本Pluginの依存なので、有効化を求められたら承諾します。
+4. Editorから再起動を求められたら、再起動します。
+5. Model Context Protocol側で、All ToolsetsまたはLandscapeMCPのToolsetを有効にします。
+6. MCPクライアントをEditorのMCP Serverへ接続します。接続先はModel Context Protocol Pluginの設定に従ってください。検証環境では`http://127.0.0.1:8000/mcp`（HTTP）でした。
+7. `list_toolsets`に`LandscapeMCP.LandscapeMCPToolset`が現れ、`describe_toolset`でVersion `0.4`と13 Toolが返ることを確認します。
+
+Pluginsの画面を使わない場合は、`.uproject`の`Plugins`へ`{"Name": "LandscapeMCP", "Enabled": true}`と`{"Name": "ModelContextProtocol", "Enabled": true}`を追加しても同じです。
 
 PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存ではありません。
 
