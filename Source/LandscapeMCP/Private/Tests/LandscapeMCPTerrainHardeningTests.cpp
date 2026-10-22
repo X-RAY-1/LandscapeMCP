@@ -456,7 +456,8 @@ bool FLandscapeMCPTerrainHardeningTest::RunTest(const FString& Parameters)
         TEXT("GetSlope"),TEXT("GetHeightRegion"),TEXT("EvaluateWalkability"),TEXT("AnalyzeSlopeNeighborhood"),TEXT("EvaluateWalkabilityRegion") })
     { TestTrue(*FString::Printf(TEXT("official schema includes %s"),Tool),Schema.Contains(Tool)); }
     TestTrue(TEXT("schema exposes the new triangle field"),Schema.Contains(TEXT("maxTriangleSlopeDegrees")));
-    TestEqual(TEXT("toolset version"),GetDefault<ULandscapeMCPToolset>()->GetToolsetVersion(),FString(TEXT("0.3")));
+    // Version完全一致は最新suiteで確認。v0.3の挙動assertionは変更しない。
+    TestTrue(TEXT("toolset version is 0.3 or later"),FCString::Atod(*GetDefault<ULandscapeMCPToolset>()->GetToolsetVersion()) >= 0.3 - 1.e-9);
     // facade経由でも同じ値
     TestEqual(TEXT("facade neighbourhood"),ULandscapeMCPToolset::AnalyzeSlopeNeighborhood(Path,1050,1050,10,10).LocalMaxSlopeDegrees,Diagonal,Tolerance);
     TestEqual(TEXT("facade walkability region"),ULandscapeMCPToolset::EvaluateWalkabilityRegion(Path,1000,1000,1100,1100,44.77).Classification,FString(TEXT("UNWALKABLE")));

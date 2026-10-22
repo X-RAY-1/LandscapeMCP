@@ -1,12 +1,16 @@
 # Tool仕様
 
-Toolset: `LandscapeMCP.LandscapeMCPToolset`、Version: `0.3`。v0.2で読み取り専用の`GetSlope`／`GetHeightRegion`／`EvaluateWalkability`を、v0.3で`AnalyzeSlopeNeighborhood`／`EvaluateWalkabilityRegion`を追加しました。既存Toolの入力schemaは変更していません。v0.3で`GetHeightRegion`の出力へ4 fieldを追加しています。
+Toolset: `LandscapeMCP.LandscapeMCPToolset`、Version: `0.4`、13 Tool。
+
+この文書は、作成・円形ブラシ・解析の10 Toolの仕様です。v0.4で追加した`FlattenRectangle`／`FlattenPath`／`CreateWalkablePath`は、結果の型も実行の手順も異なるため、[v0.4 Tool仕様](v0.4-tools.md)と[v0.4 Apply contract](v0.4-apply.md)に分けています。
+
+10 Toolの入力・出力の構造はv0.3.0から変えていません。v0.2で読み取り専用の`GetSlope`／`GetHeightRegion`／`EvaluateWalkability`を、v0.3で`AnalyzeSlopeNeighborhood`／`EvaluateWalkabilityRegion`と`GetHeightRegion`の出力4 fieldを追加しています。
 
 ## 共通
 
 距離・高さ・座標はワールドcm。`center`は`{x,y}`、`location` / `scale`は`{x,y,z}`。`landscapePath`は読み込み済みActorの完全Object Path、`levelPath`は読み込み済みULevelの完全Object Pathです。Asset Pathやラベルは使用できません。
 
-全書き込みToolに`bDryRun:boolean=true`があります。Dry-runは同じValidationと変更計画を実行し、対象・範囲・変更量・Sample数を返します。Heightfield・Package・Undo履歴を変更しません。本実行は同じ入力の`bDryRun:false`で行います。
+この文書の書き込みToolには`bDryRun:boolean=true`があります。Dry-runは同じValidationと変更計画を実行し、対象・範囲・変更量・Sample数を返します。Heightfield・Package・Undo履歴を変更しません。本実行は同じ入力の`bDryRun:false`で行います。
 
 成功時、公式adapterの`returnValue`に以下の共通結果を返します。
 

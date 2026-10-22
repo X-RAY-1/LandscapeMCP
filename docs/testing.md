@@ -4,7 +4,7 @@
 
 - 現在の仕様は[README](../README.md)と[Tool仕様](tools.md)を正とします。この文書の記述と食い違う場合は、そちらが正しい内容です。
 - 各節は書いた時点の状態を記録しています。レビュー前の結果、当時のbranch名、当時のTool数やVersionを含み、後から書き換えていません。
-- 最新の検証結果は、末尾の「v0.3.0 公開準備の検証」です。
+- 最新の検証結果は、末尾の「v0.4.0の検証」です。
 
 ## FreezeまでのE2E（2026-10-05〜2026-10-06）
 
@@ -227,3 +227,32 @@ BuildPluginの出力には次のものが含まれます。`Source`、`Binaries/
 `VersionName`を`0.3.0`へ変更した後、clean checkoutからBuildと3 suiteのAutomationを再実行し、同じ結果を確認しました。
 
 MCP経由のE2Eは、公開準備では再実行していません。コードがv0.3のMerge時点から変わっていないためです。
+
+## v0.4.0の検証（2026-10-13）
+
+`FlattenRectangle`／`FlattenPath`／`CreateWalkablePath`を追加したv0.4.0の検証です。Buildは、検証用の隔離ProjectへPluginをソースごと置き、UnrealBuildTool（UnrealEditor / Win64 / Development）で行いました。
+
+| 項目 | 結果 |
+|---|---|
+| Build（UE5.8、Win64 Development Editor） | 成功 |
+| Automation 60 suite | 60 Success、警告0、失敗0、未実行0 |
+| MCP HTTPの往復（外部clientと連携した`LandscapeMCP.V04.MCP.TransportRoundTrip`） | Dry-run、Apply、同じrequestの再送で`NO_CHANGE`、診断の`stage`、検証済みrollback、rollback失敗とlatch、latch後のDry-run を確認 |
+| 公式schema | Version `0.4`、13 Tool。既存10 Toolはv0.3.0のtagと比べて構造・type・required・defaultの差なし（説明文1件だけ変更） |
+| 保存と副作用 | 全fixtureで保存event 0、検証用ProjectのContentは実行前後で同一 |
+
+Automationが確認している主な内容:
+
+- **計画**: 経路のsampling、矩形・経路とtriangleの交差、falloffと量子化、高さの3方式、勾配を抑える縦断profile
+- **Dry-run**: 元データ、Package dirty、Undo履歴、他のActorを変更しないこと
+- **Apply**: 3 Toolと高さの3方式、平坦・山・穴・上り・下りの地形、折れのある経路。変更1回につきTransactionが1つ、Undoで元データが完全一致、Redoで計画どおり
+- **collision**: Chaos heightfieldの量子化（rangeの拡大と縮小、component境界、平坦、負の高さ、大きなWorld高度）を独立に計算した予測と、line traceの実測の一致
+- **rollbackとlatch**: 書き込み後の各段階にfaultを注入し、検証済みのrollback、rollbackを証明できない場合の停止、他のTransactionをUndoしないことを確認
+- **retry**: 連続した同じrequest、Undo後の再適用、Redo後の再送、重なる編集の後の再計画、128件を超えたときの破棄、400 requestの連続実行
+- **prop**: 上下にStaticMesh、壁、複数のprop、別のLandscapeがある状態でのApplyとrollback。collisionが壊れている場合は従来どおり失敗すること
+- **診断**: 各段階の`stage`と、reasonに`: `を含む場合
+
+このほか、実装とは別の検証者による独立した再Build・再実行と、Editor上での目視・Undo／Redo・PIEでの歩行の確認を行っています。
+
+測定した所要時間の例（Ryzen 7 7800X3D、UE5.8 Editor。保証値ではありません）: 幅4m・長さ30m程度の編集のApplyが約6ms、同じrequestの再送が約1ms、上限に近い大きさ（読み取り16384頂点、検証する三角形 約3万枚）のApplyが約100〜140ms。
+
+確認していないこと: UE5.8 / Win64 Editor以外の環境、`RunUAT BuildPlugin`によるv0.4.0のBuild、CharacterMovementやNavMeshでの通行と`CreateWalkablePath`の結果の対応（環境に依存します）、256個を超えるpropがある場合の拒否。

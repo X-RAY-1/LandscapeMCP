@@ -27,7 +27,7 @@ Radiusは(0,5000]cm、Sculpt Strengthは[0,1000]cm、Smooth／Flatten Strength�
 
 `GetSlope`、`GetHeightRegion`、`EvaluateWalkability`、`AnalyzeSlopeNeighborhood`、`EvaluateWalkabilityRegion`は、`GetHeight`と同じ対象解決・同じValidation・同じ元mipコピー経路を使います。Transaction、`Modify`、Package dirty化、Undo履歴の変更、保存を行いません。`bDryRun`引数はありません。
 
-- 対象条件はv0.1から緩めていません。PIE／Save／GC中、World Partition、Streaming Proxy、複雑なEdit Layerなどは同じ理由で拒否します。
+- 対象条件は書き込みToolと同じです。PIE／Save／GC中、World Partition、Streaming Proxy、複雑なEdit Layerなどは同じ理由で拒否します。
 - `sampleDistanceCm`と`sampleSpacingCm`はfiniteかつ[1,5000]cm。`walkableFloorAngleDeg`はfiniteかつ[0,90]。
 - `radiusCm`はfiniteかつ(0,5000]。
 - `GetHeightRegion`と`EvaluateWalkabilityRegion`は逆転した範囲（min > max）を拒否する。
@@ -49,3 +49,15 @@ UndoはEditor既存コマンドを使用します。書き込みのnested transa
 保存／Autosave APIを呼ばず、Autosave設定も変更しません。書き込みによるPackage dirty化はUndoに必要です。Editor独立AutosaveはTool外なので、保存禁止の試験では別途無効にした隔離Editorを使用してください。
 
 付属FoliageやTexture共有など、別Actorへ影響し得る構成を拒否します。Collision更新は実行しますが、結果の歩行可能性を保証するToolではありません。SlopeやCharacter設定の確認が必要です。
+
+## v0.4の3 Tool（FlattenRectangle / FlattenPath / CreateWalkablePath）
+
+上の対象条件と入力の検証に加えて、本実行（`bDryRun=false`）では次を行います。詳細は[v0.4 Apply contract](v0.4-apply.md)にあります。
+
+- **Apply専用の安全条件**: 実行中のTransactionがないこと、Autosave・自動checkoutが無効でSource Controlのproviderが有効でないこと、materialがEngineのdefault materialでGrassの状態がないこと、collisionがHeightfieldと同じ解像度であること。Dry-runではこれらを検査しません。
+- **書き込み直前の再検証**: 対象のidentity、元データ（1セルのhaloを含む）、周辺の状態が計画時と同じであることを確認します。違えば`STALE_PLAN`で拒否し、自動では再計画しません。
+- **1 request = 1 Transaction**: 自分専用のTransactionを1つだけ作ります。`NO_CHANGE`と拒否ではTransactionを作りません。
+- **書き込み後の検証**: 元データの完全一致、geometry、周辺の状態、実際のcollision（独立に予測した量子化後の形との比較）を確認します。
+- **rollback**: 検証に失敗したら、最新のundo entryが自分のTransactionであることを確認したうえでそれだけをUndoし、元データ・identity・周辺の状態・collisionが元に戻ったことを検証します。他のTransactionはUndoしません。
+- **safety latch**: 元に戻ったことを証明できない場合は`ROLLBACK_FAILED`を返し、Editorを再起動するまで3 ToolのApplyを拒否します。Dry-runと読み取りは使えます。公開の復旧APIはありません。
+- **保存と設定**: 保存、checkout、Editor設定の変更を行いません。

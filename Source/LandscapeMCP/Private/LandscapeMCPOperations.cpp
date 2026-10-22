@@ -1,5 +1,25 @@
 #include "LandscapeMCPOperations.h"
 #include "LandscapeMCPTerrainAnalysis.h"
+#include "LandscapeMCPHeightfieldAccess.h"
+#include "LandscapeMCPPathSampling.h"
+#include "LandscapeMCPApply.h"
+#include "LandscapeMCPCollisionModel.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Chaos/HeightField.h"
+#endif
+#include "Editor/Transactor.h"
+#include "LandscapeHeightfieldCollisionComponent.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialExpressionLandscapeGrassOutput.h"
+#include "Serialization/ObjectWriter.h"
+#include "Misc/Crc.h"
+#include "GameFramework/WorldSettings.h"
+#include "Settings/EditorLoadingSavingSettings.h"
+#include "ISourceControlModule.h"
+#include "ISourceControlProvider.h"
 #include "Editor.h"
 #include "Engine/Level.h"
 #include "Engine/Texture2D.h"
@@ -44,7 +64,7 @@ namespace
         if (!Level || Level->GetWorld() != GEditor->GetEditorWorldContext().World())
         { Error = TEXT("Exact Level path must identify a loaded Level in the current Editor world."); return false; }
         if (Level->GetWorld()->GetWorldPartition() || Level->IsUsingExternalActors())
-        { Error = TEXT("World Partition / external-actor Levels are unsupported in v0.1."); return false; }
+        { Error = TEXT("World Partition / external-actor Levels are unsupported."); return false; }
         if (!Level->bIsVisible || FLevelUtils::IsLevelLocked(Level))
         { Error = TEXT("Hidden or locked Levels are unsupported."); return false; }
         return true;
@@ -79,7 +99,7 @@ namespace
         if (!VectorValid(T.Origin) || !T.Actor->GetActorQuat().Equals(FQuat::Identity, 1.e-8)
             || !VectorValid(T.Scale) || T.Scale.GetMin() < 1 || T.Scale.GetMax() > 1000)
         { Error = TEXT("Only unrotated Landscapes with positive scales in [1,1000] are supported."); return false; }
-        if (T.Actor->IsNaniteEnabled()) { Error = TEXT("Nanite Landscapes are unsupported in v0.1."); return false; }
+        if (T.Actor->IsNaniteEnabled()) { Error = TEXT("Nanite Landscapes are unsupported."); return false; }
         const TArray<ULandscapeEditLayerBase*> Layers = T.Actor->GetEditLayers();
         if (Layers.Num() != 1 || !Layers[0] || Layers[0]->GetClass() != ULandscapeEditLayer::StaticClass()
             || Layers[0]->IsLocked() || !Layers[0]->IsVisible()
@@ -96,7 +116,7 @@ namespace
         const int64 Width = int64(T.Extent.Max.X) - T.Extent.Min.X + 1;
         const int64 Height = int64(T.Extent.Max.Y) - T.Extent.Min.Y + 1;
         if (Width < 2 || Height < 2 || Width * Height > MaxCreateSamples)
-        { Error = TEXT("Landscape exceeds the v0.1 total sample limit."); return false; }
+        { Error = TEXT("Landscape exceeds the supported total sample limit."); return false; }
         for (ULandscapeComponent* C : T.Actor->LandscapeComponents)
         {
             if (!C || C->GetLandscapeProxy() != T.Actor || !C->GetLayerData(T.LayerGuid))
@@ -117,11 +137,12 @@ namespace
     class FSourceReader
     {
     public:
-        explicit FSourceReader(const FTarget& InTarget) : T(InTarget) {}
-        bool Read(int32 X, int32 Y, uint16& Value, FString& Error)
+        explicit FSourceReader(const FTarget& InTarget, int64 InByteLimit = MAX_int64) : T(InTarget), ByteLimit(InByteLimit) {}
+        int64 GetCachedBytes() const { return CachedBytes; }
+        bool Read(int32 X, int32 Y, uint16& Value, FString& Error, ULandscapeComponent* ExactComponent = nullptr)
         {
-            ULandscapeComponent* Component = nullptr;
-            for (ULandscapeComponent* C : T.Actor->LandscapeComponents)
+            ULandscapeComponent* Component = ExactComponent;
+            if (!Component) for (ULandscapeComponent* C : T.Actor->LandscapeComponents)
             {
                 const FIntPoint Base = C->GetSectionBase();
                 if (X >= Base.X && Y >= Base.Y && X <= Base.X + C->ComponentSizeQuads && Y <= Base.Y + C->ComponentSizeQuads)
@@ -151,10 +172,14 @@ namespace
                     }
                 }
                 if (bShared) { Error = TEXT("Heightmap texture is shared by another Landscape; edit refused."); return false; }
+                const int64 ByteCount=int64(Texture->Source.GetSizeX())*Texture->Source.GetSizeY()*sizeof(FColor);
+                if(ByteCount>ByteLimit-CachedBytes)
+                { Error=TEXT("SAMPLE_LIMIT_EXCEEDED: cached source mip budget exceeded.");return false; }
                 TArray64<uint8> Copy;
                 if (!Texture->Source.GetMipData(Copy, 0) || Copy.Num() != int64(Texture->Source.GetSizeX()) * Texture->Source.GetSizeY() * sizeof(FColor))
                 { Error = TEXT("Unable to read complete source heightmap mip."); return false; }
                 Bytes = &Cache.Add(Texture, MoveTemp(Copy));
+                CachedBytes+=ByteCount;
             }
             const FIntPoint Local = FIntPoint(X,Y) - Component->GetSectionBase();
             const int32 SX = FMath::Min(Local.X / Component->SubsectionSizeQuads, Component->NumSubsections - 1);
@@ -167,18 +192,20 @@ namespace
             const FColor& Color = Colors[TX + TY * Texture->Source.GetSizeX()];
             Value = (uint16(Color.R) << 8) | Color.G; return true;
         }
-        bool Region(const FIntRect& Rect, TArray<uint16>& Values, FString& Error)
+        bool Region(const FIntRect& Rect, TArray<uint16>& Values, FString& Error, ULandscapeComponent* ExactComponent = nullptr)
         {
             Values.SetNumUninitialized((Rect.Width()+1)*(Rect.Height()+1));
             int32 Index = 0;
             for (int32 Y = Rect.Min.Y; Y <= Rect.Max.Y; ++Y)
                 for (int32 X = Rect.Min.X; X <= Rect.Max.X; ++X)
-                    if (!Read(X,Y,Values[Index++],Error)) { return false; }
+                    if (!Read(X,Y,Values[Index++],Error,ExactComponent)) { return false; }
             return true;
         }
     private:
         const FTarget& T;
         TMap<UTexture2D*, TArray64<uint8>> Cache;
+        int64 ByteLimit = MAX_int64;
+        int64 CachedBytes = 0;
     };
     double WorldHeight(const FTarget& T, double Encoded) { return T.Origin.Z + (Encoded - 32768.0) * T.Scale.Z / 128.0; }
     bool Encode(double WorldZ, double OriginZ, double ScaleZ, uint16& Out)
@@ -266,6 +293,39 @@ FLandscapeMCPResult Create(const FString& LevelPath, const FString& Name, FVecto
     }
     R.Message = TEXT("Landscape created and source height verified; Undo available; nothing saved.");
     return R;
+}
+
+bool Authoring::EncodeHeight(double WorldZ,double OriginZ,double ScaleZ,uint16& Out)
+{ return Encode(WorldZ,OriginZ,ScaleZ,Out); }
+
+bool Authoring::ReadSnapshot(const FString& Path,FVector2D Min,FVector2D Max,FHeightfieldSnapshot& Out,FString& Code,FString& Error)
+{
+    Out={};
+    if(!Coordinate(Min.X)||!Coordinate(Min.Y)||!Coordinate(Max.X)||!Coordinate(Max.Y)||Min.X>Max.X||Min.Y>Max.Y)
+    {Code=TEXT("INVALID_COORDINATE");Error=Code;return false;}
+    FTarget T;
+    if(!Resolve(Path,T,Error))
+    {
+        Code=Error.Contains(TEXT("foliage"))?TEXT("FOLIAGE_SAFETY_CONFLICT"):TEXT("UNSUPPORTED_LANDSCAPE_STATE");
+        if(Error.Contains(TEXT("not found")))Code=TEXT("TARGET_NOT_FOUND");
+        if(Error.Contains(TEXT("exact loaded")))Code=TEXT("INVALID_TARGET_PATH");
+        return false;
+    }
+    const FVector2D LocalMin((Min.X-T.Origin.X)/T.Scale.X,(Min.Y-T.Origin.Y)/T.Scale.Y);
+    const FVector2D LocalMax((Max.X-T.Origin.X)/T.Scale.X,(Max.Y-T.Origin.Y)/T.Scale.Y);
+    const int32 X0=FMath::FloorToInt(LocalMin.X),Y0=FMath::FloorToInt(LocalMin.Y),X1=FMath::CeilToInt(LocalMax.X),Y1=FMath::CeilToInt(LocalMax.Y);
+    if((int64(X1)-X0+1)*(int64(Y1)-Y0+1)>Authoring::MaxAabbCandidates)
+    {Code=TEXT("SAMPLE_LIMIT_EXCEEDED");Error=TEXT("Unclipped AABB exceeds 65536 candidates.");return false;}
+    if(X1<T.Extent.Min.X||Y1<T.Extent.Min.Y||X0>T.Extent.Max.X||Y0>T.Extent.Max.Y)
+    {Code=TEXT("OUTSIDE_LANDSCAPE");Error=Code;return false;}
+    const FIntRect Rect(FMath::Max(T.Extent.Min.X,X0-1),FMath::Max(T.Extent.Min.Y,Y0-1),FMath::Min(T.Extent.Max.X,X1+1),FMath::Min(T.Extent.Max.Y,Y1+1));
+    const int64 Count=(int64(Rect.Max.X)-Rect.Min.X+1)*(int64(Rect.Max.Y)-Rect.Min.Y+1);
+    if(Count>Authoring::MaxReadVertices)
+    {Code=TEXT("SAMPLE_LIMIT_EXCEEDED");Error=TEXT("Read and verification halo exceeds 16384 vertices.");return false;}
+    FSourceReader Reader(T,Authoring::MaxCachedSourceBytes);
+    if(!Reader.Region(Rect,Out.Heights,Error))
+    {Code=Error.StartsWith(TEXT("SAMPLE_LIMIT_EXCEEDED"))?TEXT("SAMPLE_LIMIT_EXCEEDED"):TEXT("UNSUPPORTED_SOURCE_DATA");return false;}
+    Out.Origin=T.Origin;Out.Scale=T.Scale;Out.Extent=T.Extent;Out.Rect=Rect;Out.CachedSourceBytes=Reader.GetCachedBytes();return true;
 }
 
 FLandscapeMCPResult Height(const FString& Path, double X, double Y)
@@ -675,5 +735,441 @@ FLandscapeMCPWalkabilityRegionResult WalkabilityRegion(const FString& Path, doub
     R.HeightQuantizationCm = T.Scale.Z/128;
     R.Message = TEXT("Read-only geometry evaluation of the Landscape triangles (diagonal 00-11) against the caller-supplied angle; CharacterMovement is not consulted. No package or transaction changes.");
     return R;
+}
+}
+
+namespace LandscapeMCP::Authoring
+{
+namespace
+{
+    // Module lifetime, game-thread only. Never reset by a production request.
+    bool bMutationDisabled=false;
+#if WITH_DEV_AUTOMATION_TESTS
+    EApplyFault AutomationFault=EApplyFault::None;
+    bool Fault(EApplyFault F){return GIsAutomationTesting&&AutomationFault==F;}
+#else
+    enum class EApplyFault { None,SourceMismatch,FreshReadFailure,GeometryMismatch,CollisionFailure,UndoFalse,RestoreMismatch,
+        RestoreCollisionFailure,OwnershipMismatch,InsertUnrelatedTransaction,StaleSource,RestoreCodecMismatch,RestoreCollisionStale };
+    bool Fault(EApplyFault){return false;}
+#endif
+    struct FIdentity
+    {
+        TArray<TWeakObjectPtr<UObject>> Objects;
+        FString State;
+        FTransform Transform;
+        uint32 LayerHash=0;
+        bool operator==(const FIdentity& B)const{return Objects==B.Objects&&State==B.State&&Transform.Equals(B.Transform,0)&&LayerHash==B.LayerHash;}
+    };
+    struct FCollateral
+    {
+        TArray<TWeakObjectPtr<UObject>> Objects;
+        TArray<uint32> Hashes;
+        TArray<FString> Paths;
+        bool operator==(const FCollateral& B)const{return Objects==B.Objects&&Hashes==B.Hashes&&Paths==B.Paths;}
+    };
+    struct FRetryRecord
+    {
+        FPreviewRequest Request;FIdentity Identity;FHeightfieldSnapshot ResultSnapshot;
+        FPreparedTerrainPlan Plan;FLandscapeMCPTerrainOperationResult Result;
+    };
+    // Bounded idempotency cache: one record per request, oldest first, the oldest
+    // is evicted at capacity. It only answers "this exact request was already
+    // applied and the terrain still equals its verified result" (NO_CHANGE).
+    // A missing, evicted or stale record is never a reason to accept or refuse:
+    // the request is then validated, planned and verified from fresh state.
+    constexpr int32 MaxRetryRecords=128;
+    TArray<FRetryRecord> RetryRecords;
+    bool SameRequest(const FPreviewRequest& A,const FPreviewRequest& B)
+    {
+        return A.Operation==B.Operation&&A.LandscapePath==B.LandscapePath&&A.Points==B.Points&&A.Center==B.Center
+            &&A.SizeX==B.SizeX&&A.SizeY==B.SizeY&&A.Width==B.Width&&A.Falloff==B.Falloff&&A.MaxDelta==B.MaxDelta
+            &&A.HeightMode==B.HeightMode&&A.TargetHeight==B.TargetHeight&&A.MaxSlope==B.MaxSlope&&A.Yaw==B.Yaw;
+    }
+    void RememberRetry(FRetryRecord&& Record)
+    {
+        RetryRecords.RemoveAll([&](const FRetryRecord& Old){return SameRequest(Old.Request,Record.Request);});
+        while(RetryRecords.Num()>=MaxRetryRecords)RetryRecords.RemoveAt(0);
+        RetryRecords.Add(MoveTemp(Record));
+    }
+    bool GrassSafe(const FTarget& T,FString& Error)
+    {
+        // Deliberately narrow allowlist. Material Instances, custom materials,
+        // LOD overrides and grass caches are refused, including unknown graphs.
+        UMaterial* Default=UMaterial::GetDefaultMaterial(MD_Surface);
+        if(!Default||!Default->GetEditorOnlyData()||T.Actor->GetLandscapeMaterial()!=Default
+            ||!T.Actor->GetPerLODOverrideMaterials().IsEmpty()||!T.Actor->GetGrassTypesOverrides().IsEmpty()
+            ||!T.Actor->FoliageComponents.IsEmpty()||!T.Actor->AsyncFoliageTasks.IsEmpty())
+        {Error=TEXT("Only the inspectable engine default material without grass state is supported for Apply.");return false;}
+        TArray<UMaterialExpressionLandscapeGrassOutput*> Grass;
+        Default->GetAllExpressionsInMaterialAndFunctionsOfType(Grass);
+        if(!Grass.IsEmpty()){Error=TEXT("Landscape Grass Output is present.");return false;}
+        for(ULandscapeComponent* C:T.Actor->LandscapeComponents)
+            if(C->GetLandscapeMaterial()!=Default||!C->GetPerLODOverrideMaterials().IsEmpty()||!C->GetNamedGrassTypes().IsEmpty())
+            {Error=TEXT("Component material override or grass state is unsupported.");return false;}
+        return true;
+    }
+    bool CaptureTarget(const FString& Path,FTarget& T,FIdentity& I,FString& Code,FString& Error)
+    {
+        I={};if(!Resolve(Path,T,Error)){Code=Error.Contains(TEXT("foliage"))?TEXT("FOLIAGE_SAFETY_CONFLICT"):TEXT("UNSUPPORTED_LANDSCAPE_STATE");return false;}
+        if(!GEditor->Trans||GEditor->IsTransactionActive()||GIsTransacting){Code=TEXT("ACTIVE_TRANSACTION");Error=TEXT("An idle Editor transaction buffer is required.");return false;}
+        const auto* SavePolicy=GetDefault<UEditorLoadingSavingSettings>();
+        if(!SavePolicy||SavePolicy->bAutoSaveEnable||SavePolicy->GetAutomaticallyCheckoutOnAssetModification()
+            ||ISourceControlModule::Get().GetProvider().IsEnabled())
+        {Code=TEXT("UNSUPPORTED_EDITOR_SAVE_POLICY");Error=TEXT("Apply requires autosave and automatic checkout disabled, and an inactive source control provider; no Editor settings are changed by this tool.");return false;}
+        if(!GrassSafe(T,Error)){Code=TEXT("UNSUPPORTED_GRASS_STATE");return false;}
+        if(T.Actor->CollisionMipLevel!=0||T.Actor->SimpleCollisionMipLevel!=0||T.Actor->bBakeMaterialPositionOffsetIntoCollision)
+        {Code=TEXT("UNSUPPORTED_COLLISION_STATE");Error=TEXT("Native mip0 collision without material offsets is required.");return false;}
+        I.Objects={T.Actor,T.Info,T.Actor->GetEditLayer(0),T.Actor->GetLevel(),T.Actor->GetLandscapeMaterial()};
+        I.Transform=T.Actor->GetActorTransform();
+        TArray<uint8> LayerBytes;FObjectWriter LayerWriter(T.Actor->GetEditLayer(0),LayerBytes);I.LayerHash=FCrc::MemCrc32(LayerBytes.GetData(),LayerBytes.Num());
+        I.State=Path+TEXT("|")+T.Actor->GetLandscapeGuid().ToString()+TEXT("|")+T.Actor->GetActorTransform().ToString()+TEXT("|")+T.LayerGuid.ToString()
+            +FString::Printf(TEXT("|%d,%d,%d,%d"),T.Extent.Min.X,T.Extent.Min.Y,T.Extent.Max.X,T.Extent.Max.Y);
+        for(ULandscapeComponent* C:T.Actor->LandscapeComponents)
+        {
+            if(C->CollisionMipLevel!=0||C->SimpleCollisionMipLevel!=0||!C->GetCollisionComponent())
+            {Code=TEXT("UNSUPPORTED_COLLISION_STATE");Error=TEXT("Every component requires native mip0 collision.");return false;}
+            I.Objects.Add(C);I.Objects.Add(C->GetCollisionComponent());I.Objects.Add(C->GetHeightmap(T.LayerGuid));I.Objects.Add(C->GetHeightmap());
+            I.State+=FString::Printf(TEXT("|%d,%d,%d,%d,%d|%s"),C->GetSectionBase().X,C->GetSectionBase().Y,C->ComponentSizeQuads,C->SubsectionSizeQuads,C->NumSubsections,*C->HeightmapScaleBias.ToString());
+        }
+        for(const auto& O:I.Objects)
+        {
+            if(!O.IsValid()){Code=TEXT("UNSUPPORTED_LANDSCAPE_STATE");Error=TEXT("Missing target identity.");return false;}
+            I.State+=TEXT("|")+O->GetPathName();
+        }
+        return true;
+    }
+    bool CaptureCollateral(const FTarget& T,FCollateral& Out,FString& Error)
+    {
+        Out={};
+        for(ULevel* L:T.Actor->GetWorld()->GetLevels())
+        {
+            Out.Objects.Add(L);Out.Paths.Add(L->GetPathName());Out.Hashes.Add(L->Actors.Num());
+            for(AActor* A:L->Actors)
+            {
+                if(!A){Out.Objects.Add(nullptr);Out.Paths.Add(TEXT("null"));Out.Hashes.Add(0);continue;}
+                Out.Objects.Add(A);Out.Paths.Add(A->GetPathName());
+                if(A==T.Actor){Out.Hashes.Add(0);continue;}
+                TArray<uint8> Bytes;FObjectWriter Writer(A,Bytes);Out.Hashes.Add(FCrc::MemCrc32(Bytes.GetData(),Bytes.Num()));
+            }
+        }
+        TSet<UTexture2D*> Seen;
+        for(ULandscapeComponent* C:T.Actor->LandscapeComponents)
+        {
+            TArray<UTexture2D*> Textures;
+            for(UTexture2D* W:C->GetWeightmapTextures())Textures.AddUnique(W);
+            C->ForEachLayer([&](const FGuid&,FLandscapeLayerComponentData& D){for(UTexture2D* W:D.WeightmapData.Textures)Textures.AddUnique(W);});
+            for(UTexture2D* W:Textures)
+            {
+                if(!W||Seen.Contains(W))continue;Seen.Add(W);TArray64<uint8> Bytes;
+                if(!W->Source.GetMipData(Bytes,0)||Bytes.Num()>MAX_int32){Error=TEXT("Unable to snapshot weightmap collateral.");return false;}
+                Out.Objects.Add(W);Out.Paths.Add(W->GetPathName());Out.Hashes.Add(FCrc::MemCrc32(Bytes.GetData(),int32(Bytes.Num())));
+            }
+        }
+        return true;
+    }
+    bool SameSnapshot(const FHeightfieldSnapshot& A,const FHeightfieldSnapshot& B)
+    {return A.Rect==B.Rect&&A.Extent==B.Extent&&A.Origin==B.Origin&&A.Scale==B.Scale&&A.Heights==B.Heights;}
+    bool CollisionMatches(const FTarget& T,const FHeightfieldSnapshot& S,const FPreparedTerrainPlan& P,FString& Error,double WalkThreshold=0,const TArray<uint16>* Planned=nullptr)
+    {
+        using namespace CollisionCodec;
+        if(P.Core.Num()!=2*(S.CountX()-1)*(S.CountY()-1)||P.Transition.Num()!=P.Core.Num())return false;
+        const double Start=FPlatformTime::Seconds();double TriangleSeconds=0,TraceSeconds=0,CompareSeconds=0;
+        struct FComponentModel {ULandscapeComponent* Component;FModel Model;};
+        TArray<FComponentModel> Models;
+        // Complete component domain is required for independent min/max. This
+        // metadata scan is separate from the frozen 16384 request+halo samples;
+        // bounded by Resolve's 262144 total landscape samples and 32MiB mip cache.
+        FSourceReader Reader(T,32ll*1024*1024);
+        for(ULandscapeComponent* C:T.Actor->LandscapeComponents)
+        {
+            const FIntPoint Base=C->GetSectionBase();const int32 Q=C->ComponentSizeQuads;
+            if(Base.X>S.Rect.Max.X||Base.Y>S.Rect.Max.Y||Base.X+Q<S.Rect.Min.X||Base.Y+Q<S.Rect.Min.Y)continue;
+            TArray<uint16> Input;
+            // A duplicated shared-edge texel must come from THIS component,
+            // not whichever component the legacy global reader finds first.
+            if(!Reader.Region(FIntRect(Base,Base+FIntPoint(Q,Q)),Input,Error,C))return false;
+            FComponentModel M;M.Component=C;
+            // Independently validate all requested source samples against the
+            // fresh source scan. Expected data never comes from packed Chaos.
+            for(int32 Y=FMath::Max(Base.Y,S.Rect.Min.Y);Y<=FMath::Min(Base.Y+Q,S.Rect.Max.Y);++Y)
+                for(int32 X=FMath::Max(Base.X,S.Rect.Min.X);X<=FMath::Min(Base.X+Q,S.Rect.Max.X);++X)
+                    if(Input[(Y-Base.Y)*(Q+1)+X-Base.X]!=S.Heights[(Y-S.Rect.Min.Y)*S.CountX()+X-S.Rect.Min.X])
+                    {Error=TEXT("Codec source domain does not match verified source snapshot.");return false;}
+            if(Planned)
+                for(int32 Y=FMath::Max(Base.Y,S.Rect.Min.Y);Y<=FMath::Min(Base.Y+Q,S.Rect.Max.Y);++Y)
+                    for(int32 X=FMath::Max(Base.X,S.Rect.Min.X);X<=FMath::Min(Base.X+Q,S.Rect.Max.X);++X)
+                        Input[(Y-Base.Y)*(Q+1)+X-Base.X]=(*Planned)[(Y-S.Rect.Min.Y)*S.CountX()+X-S.Rect.Min.X];
+            if(!Build(Input,Q+1,Q+1,M.Model))return false;
+            Models.Add(MoveTemp(M));
+        }
+        const double PredictionSeconds=FPlatformTime::Seconds()-Start;
+        FCollisionQueryParams Query(SCENE_QUERY_STAT(LandscapeMCPV04Verify),true);Query.bReturnFaceIndex=true;
+        // The object under test is the target component's actual physics, not
+        // whichever WorldStatic body the ray meets first. Components that are
+        // not the expected collision component are stepped past by identity
+        // and stay ignored for the rest of this verification; the target hit is
+        // still required and compared with unchanged tolerances. The channel
+        // query is kept on purpose: a per-body trace would also see the
+        // editor-only heightfield shape of the same component.
+        constexpr int32 MaxSteppedComponents=256;
+        int32 Verified=0,Stepped=0;
+        for(int32 Index=0;Index<P.Core.Num();++Index)if(P.Core[Index]||P.Transition[Index])
+        {
+            double Tick=FPlatformTime::Seconds();
+            const int32 Cell=Index/2,GX=S.Rect.Min.X+Cell%(S.CountX()-1),GY=S.Rect.Min.Y+Cell/(S.CountX()-1);
+            const bool Upper=Index%2!=0;
+            const FComponentModel* M=Models.FindByPredicate([&](const FComponentModel& V){const auto B=V.Component->GetSectionBase();return GX>=B.X&&GY>=B.Y&&GX<B.X+V.Component->ComponentSizeQuads&&GY<B.Y+V.Component->ComponentSizeQuads;});
+            if(!M){Error=TEXT("Missing collision component for native triangle.");return false;}
+            const auto Base=M->Component->GetSectionBase();const int32 Local=(GY-Base.Y)*M->Model.Cols+GX-Base.X;
+            const auto Position=[&](int32 X,int32 Y,int32 I){return FVector(T.Origin.X+X*T.Scale.X,T.Origin.Y+Y*T.Scale.Y,T.Origin.Z+M->Model.Height(I)*T.Scale.Z/128.0);};
+            const auto Expected=Triangle(Position(GX,GY,Local),Position(GX+(Upper?0:1),GY+(Upper?1:0),Local+(Upper?M->Model.Cols:1)),Position(GX+1,GY+1,Local+M->Model.Cols+1));
+            const double Top=FMath::Max3(Expected.A.Z,Expected.B.Z,Expected.C.Z)+2000;
+            const double Bottom=FMath::Min3(Expected.A.Z,Expected.B.Z,Expected.C.Z)-2000;
+            TriangleSeconds+=FPlatformTime::Seconds()-Tick;Tick=FPlatformTime::Seconds();
+            FHitResult Hit;bool HitOK=false;
+            while(!Planned)
+            {
+                HitOK=T.Actor->GetWorld()->LineTraceSingleByChannel(Hit,FVector(Expected.Centroid.X,Expected.Centroid.Y,Top),FVector(Expected.Centroid.X,Expected.Centroid.Y,Bottom),ECC_WorldStatic,Query);
+                UPrimitiveComponent* Other=HitOK?Hit.GetComponent():nullptr;
+                if(!Other||Other==M->Component->GetCollisionComponent())break;
+                if(Stepped>=MaxSteppedComponents){Error=TEXT("More than 256 other WorldStatic components lie on the collision verification rays.");return false;}
+                Query.AddIgnoredComponent(Other);++Stepped;
+            }
+            TraceSeconds+=FPlatformTime::Seconds()-Tick;Tick=FPlatformTime::Seconds();
+            // gamma(128) bound for the double scalar triangle raycast, world/local
+            // translations, barycentric arithmetic and normal normalization.
+            // Float SIMD bounds only cull cells; GetPointsScaled and the zero-
+            // thickness RayTriangleIntersection path use Chaos::FReal (double).
+            constexpr double U=2.2204460492503131e-16/2;
+            constexpr double Gamma=128*U/(1-128*U);
+            const double Magnitude=Expected.A.GetAbs().GetMax()+Expected.B.GetAbs().GetMax()+Expected.C.GetAbs().GetMax()+FMath::Abs(Top)+FMath::Abs(Bottom)+T.Origin.GetAbs().GetMax()+1;
+            const double LocationTolerance=Gamma*Magnitude;
+            // FHitResult.Location is reconstructed with float HitTime and
+            // float CheckLength (CollisionConversions.cpp), unlike ImpactPoint.
+            // Three float roundings: distance, segment length, quotient.
+            constexpr double UF=5.9604644775390625e-8;
+            constexpr double GammaFloat=3*UF/(1-3*UF);
+            const double HitLocationTolerance=LocationTolerance+GammaFloat*(Top-Bottom);
+            const double NormalTolerance=8*LocationTolerance/FMath::Min(T.Scale.X,T.Scale.Y)+Gamma*16;
+            const double ActualSlope=FMath::RadiansToDegrees(FMath::Atan2(FVector2D(Hit.ImpactNormal.X,Hit.ImpactNormal.Y).Size(),Hit.ImpactNormal.Z));
+            const double SlopeTolerance=FMath::RadiansToDegrees(2*FMath::Asin(FMath::Min(1.0,NormalTolerance/2)));
+            if(WalkThreshold>0&&P.Core[Index])
+            {
+                const int32 SI=(GY-S.Rect.Min.Y)*S.CountX()+GX-S.Rect.Min.X;
+                const auto& Heights=Planned?*Planned:S.Heights;
+                auto SA=Expected.A;SA.Z=S.Decode(Heights[SI]);
+                auto SB=Expected.B;SB.Z=S.Decode(Heights[SI+(Upper?S.CountX():1)]);
+                auto SC=Expected.C;SC.Z=S.Decode(Heights[SI+S.CountX()+1]);
+                const auto Guard=Safety(Triangle(SA,SB,SC).Slope,Expected.Slope,WalkThreshold,T.Scale.Z/128.0,M->Model.Step*T.Scale.Z/128.0,T.Scale.X,T.Scale.Y,SlopeTolerance);
+                if(!Guard.bSafe){Error=FString::Printf(TEXT("Collision walkability unsafe/near-limit triangle=%d margin=%.12g"),Index,Guard.CombinedSafetyMargin);return false;}
+            }
+            if(Planned){++Verified;CompareSeconds+=FPlatformTime::Seconds()-Tick;continue;}
+            const int32 ExpectedFace=2*((GY-Base.Y)*(M->Model.Cols-1)+GX-Base.X)+(Upper?1:0);
+            const bool OK=HitOK&&Hit.GetActor()==T.Actor&&Hit.GetComponent()==M->Component->GetCollisionComponent()
+                &&(Hit.FaceIndex==INDEX_NONE||Hit.FaceIndex==ExpectedFace)
+                &&FVector::Dist(Hit.ImpactPoint,Expected.Centroid)<=LocationTolerance
+                &&FVector::Dist(Hit.Location,Expected.Centroid)<=HitLocationTolerance
+                &&FVector::Dist(Hit.ImpactNormal,Expected.Normal)<=NormalTolerance
+                &&FMath::Abs(ActualSlope-Expected.Slope)<=SlopeTolerance;
+            CompareSeconds+=FPlatformTime::Seconds()-Tick;
+            if(!OK)
+            {Error=FString::Printf(TEXT("Codec triangle %d mismatch predicted=%.12f actual=%.12f locationDelta=%.12g locationTolerance=%.12g normalDelta=%.12g normalTolerance=%.12g face=%d actor=%s."),Index,Expected.Centroid.Z,Hit.ImpactPoint.Z,FVector::Dist(Hit.ImpactPoint,Expected.Centroid),LocationTolerance,FVector::Dist(Hit.ImpactNormal,Expected.Normal),NormalTolerance,Hit.FaceIndex,*GetNameSafe(Hit.GetActor()));return false;}
+            ++Verified;
+        }
+        UE_LOG(LogTemp,Display,TEXT("COLLISION_CODEC_PERF components=%d sourceMipBytes=%lld triangles=%d predictionMs=%.6f triangleMs=%.6f traceMs=%.6f compareMs=%.6f totalMs=%.6f steppedComponents=%d"),Models.Num(),Reader.GetCachedBytes(),Verified,PredictionSeconds*1000,TriangleSeconds*1000,TraceSeconds*1000,CompareSeconds*1000,(FPlatformTime::Seconds()-Start)*1000,Stepped);
+        return true;
+    }
+    void DerivedUpdate(const FTarget& T)
+    {T.Actor->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_Heightmap_All);T.Actor->ForceUpdateLayersContent();}
+    FLandscapeMCPTerrainOperationResult MakeFailure(FLandscapeMCPTerrainOperationResult O,const FString& Code,const TCHAR* Stage,const FString& Reason)
+    {
+        O.bSuccess=false;O.bActualValid=false;O.bWalkabilityGuaranteed=false;O.ModifiedCount=0;O.ErrorCode=Code;
+        O.ActualAfter={};O.TransitionActualAfter={};
+        O.Status=TEXT("REJECTED");O.Message=FString(Stage)+TEXT(": ")+Reason;return O;
+    }
+}
+bool MutationDisabled(){return bMutationDisabled;}
+#if WITH_DEV_AUTOMATION_TESTS
+bool VerifyAutomationCollision(const FString& Path,const FHeightfieldSnapshot& S,const FPreparedTerrainPlan& P,FString& Error)
+{check(GIsAutomationTesting);FTarget T;if(!Resolve(Path,T,Error))return false;return CollisionMatches(T,S,P,Error);}
+void SetAutomationApplyFault(EApplyFault F){check(GIsAutomationTesting);AutomationFault=F;}
+void ResetAutomationApplyState(){check(GIsAutomationTesting);AutomationFault=EApplyFault::None;bMutationDisabled=false;RetryRecords.Reset();}
+int32 AutomationRetryRecordCount(){check(GIsAutomationTesting);return RetryRecords.Num();}
+#endif
+FString FormatFailureDiagnostic(const FLandscapeMCPTerrainOperationResult& Result,const FString& InStage)
+{
+    // Profile arrays are never included. Apply messages are "<stage>: <reason>";
+    // only that exact, known prefix is removed, so a colon inside the reason
+    // (or a Dry-run message without a stage prefix) cannot change the stage.
+    const FString Stage=InStage.IsEmpty()?FString(TEXT("validation")):InStage;
+    FString Reason=Result.Message;Reason.RemoveFromStart(Stage+TEXT(": "),ESearchCase::CaseSensitive);
+    TSharedRef<FJsonObject> Diagnostic=MakeShared<FJsonObject>();
+    Diagnostic->SetStringField(TEXT("errorCode"),Result.ErrorCode);
+    Diagnostic->SetStringField(TEXT("operation"),Result.Operation);
+    Diagnostic->SetStringField(TEXT("stage"),Stage.Left(64));
+    Diagnostic->SetStringField(TEXT("landscapePath"),Result.LandscapePath.Left(1024));
+    Diagnostic->SetStringField(TEXT("reason"),Reason.Left(2048));
+    Diagnostic->SetBoolField(TEXT("mutationDisabled"),MutationDisabled());
+    Diagnostic->SetStringField(TEXT("message"),Result.Message.Left(2048));
+    Diagnostic->SetStringField(TEXT("rollbackStatus"),Result.RollbackStatus);
+    FString Text;auto Writer=TJsonWriterFactory<>::Create(&Text);FJsonSerializer::Serialize(Diagnostic,Writer);
+    return Text;
+}
+FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* OutFailureStage)
+{
+    if(OutFailureStage)OutFailureStage->Reset();
+    if(R.bDryRun)return Preview(R,OutFailureStage);
+    auto Failed=[&](FLandscapeMCPTerrainOperationResult Result,const FString& FailureCode,const TCHAR* Stage,const FString& Reason)
+    {if(OutFailureStage)*OutFailureStage=Stage;return MakeFailure(MoveTemp(Result),FailureCode,Stage,Reason);};
+    const double ApplyStart=FPlatformTime::Seconds();
+    FLandscapeMCPTerrainOperationResult O;O.bDryRun=false;O.LandscapePath=R.LandscapePath;
+    O.Operation=R.Operation==EAuthoringOperation::FlattenRectangle?TEXT("FlattenRectangle"):R.Operation==EAuthoringOperation::FlattenPath?TEXT("FlattenPath"):TEXT("CreateWalkablePath");
+    if(!IsInGameThread())return Failed(O,TEXT("EDITOR_STATE"),TEXT("validation"),TEXT("Game thread required."));
+    if(bMutationDisabled)return Failed(O,TEXT("MUTATION_DISABLED_AFTER_ROLLBACK_FAILURE"),TEXT("safetyLatch"),TEXT("Restart Editor or reload module after investigating failed restoration."));
+    FPreviewRequest PreviewRequest=R;PreviewRequest.bDryRun=true;
+    FPath Path;FVector2D Min,Max;FString Code,Error;
+    if(!ValidateRequest(PreviewRequest,Path,Min,Max,Code))return Failed(O,Code,TEXT("validation"),Code);
+    FTarget Target;FIdentity Identity;FCollateral Collateral;
+    if(!CaptureTarget(R.LandscapePath,Target,Identity,Code,Error))return Failed(O,Code,TEXT("resolve"),Error);
+    FHeightfieldSnapshot Original;
+    if(!ReadSnapshot(R.LandscapePath,Min,Max,Original,Code,Error))return Failed(O,Code,TEXT("snapshot"),Error);
+    if(!CaptureCollateral(Target,Collateral,Error))return Failed(O,TEXT("UNSUPPORTED_COLLATERAL_STATE"),TEXT("snapshot"),Error);
+    const int32 Cached=RetryRecords.IndexOfByPredicate([&](const FRetryRecord& Record){return SameRequest(Record.Request,R);});
+    if(Cached!=INDEX_NONE)
+    {
+        const FRetryRecord& Record=RetryRecords[Cached];
+        if(Record.Identity==Identity&&SameSnapshot(Record.ResultSnapshot,Original))
+        {
+            // Duplicate of a verified request on unchanged terrain. Target guards,
+            // source and identity above are fresh; actual collision is re-verified.
+            if(!CollisionMatches(Target,Original,Record.Plan,Error,R.Operation==EAuthoringOperation::CreateWalkablePath?R.MaxSlope:0))return Failed(O,TEXT("COLLISION_SYNC_FAILED"),TEXT("retry"),Error);
+            O=Record.Result;O.Status=TEXT("NO_CHANGE");O.ModifiedCount=0;O.PlannedModifiedCount=0;
+            O.Before=O.PlannedAfter=O.ActualAfter;O.TransitionBefore=O.TransitionPlannedAfter=O.TransitionActualAfter;
+            O.Delta.MinDeltaCm=O.Delta.MaxDeltaCm=O.Delta.MaxRaiseCm=O.Delta.MaxLowerCm=0;
+            for(auto& Sample:O.Path.ProfileSamples)Sample.CurrentHeightCm=Sample.PlannedHeightCm;
+            O.Message=TEXT("retry: Identical request already verified at this source state; no transaction or write.");return O;
+        }
+        // The terrain or target no longer equals the recorded result (Undo, a
+        // later edit, ...). The record proves nothing about the current state:
+        // drop it and treat the request as new.
+        RetryRecords.RemoveAt(Cached);
+    }
+    RetryRecords.Reserve(MaxRetryRecords);
+    const double PlanningStart=FPlatformTime::Seconds();
+    FPreparedTerrainPlan Plan;O=PlanPreview(PreviewRequest,Original,&Plan);O.bDryRun=false;
+    if(!O.bSuccess){if(OutFailureStage)*OutFailureStage=TEXT("planning");O.Message=TEXT("planning: ")+O.Message;return O;}
+    const double PlanningMs=(FPlatformTime::Seconds()-PlanningStart)*1000;
+    O.Warnings.RemoveAll([](const FString& W){return W.StartsWith(TEXT("PREVIEW_ONLY:"));});
+    if(!CollisionMatches(Target,Original,Plan,Error))return Failed(O,TEXT("UNSUPPORTED_COLLISION_STATE"),TEXT("beforeCollision"),Error);
+    if(!CollisionMatches(Target,Original,Plan,Error,R.Operation==EAuthoringOperation::CreateWalkablePath?R.MaxSlope:0,&Plan.Quantized))
+        return Failed(O,TEXT("CANNOT_SATISFY_WALKABILITY"),TEXT("predictedCollision"),Error);
+    // Allocate the complete retry record before entering the write transaction.
+    FRetryRecord Pending;Pending.Request=R;Pending.Identity=Identity;Pending.Plan=Plan;Pending.ResultSnapshot=Original;
+    Pending.ResultSnapshot.Heights=Plan.Quantized;
+    const double PreStart=FPlatformTime::Seconds();
+    FTarget Immediate;FIdentity ImmediateIdentity;FCollateral ImmediateCollateral;FHeightfieldSnapshot ImmediateSource;
+    const bool ImmediateRead=CaptureTarget(R.LandscapePath,Immediate,ImmediateIdentity,Code,Error)
+        &&ReadSnapshot(R.LandscapePath,Min,Max,ImmediateSource,Code,Error);
+    if(Fault(EApplyFault::StaleSource)&&!ImmediateSource.Heights.IsEmpty())ImmediateSource.Heights[0]^=1;
+    if(bMutationDisabled||!ImmediateRead||!(ImmediateIdentity==Identity)||!SameSnapshot(Original,ImmediateSource)
+        ||!CaptureCollateral(Immediate,ImmediateCollateral,Error)||!(Collateral==ImmediateCollateral))
+        return Failed(O,TEXT("STALE_PLAN"),TEXT("preWrite"),TEXT("Target, source, safety state, transaction or collateral changed since planning."));
+    const double PreMs=(FPlatformTime::Seconds()-PreStart)*1000;
+    if(O.PlannedModifiedCount==0)
+    {
+        if(!VerifyPreparedGeometry(R,Original,ImmediateSource,Plan,O))return Failed(O,TEXT("POST_VERIFY_FAILED"),TEXT("noChange"),TEXT("Fresh geometry verification failed."));
+        if(!CollisionMatches(Target,ImmediateSource,Plan,Error,R.Operation==EAuthoringOperation::CreateWalkablePath?R.MaxSlope:0))return Failed(O,TEXT("COLLISION_SYNC_FAILED"),TEXT("noChangeCollision"),Error);
+        O.Status=TEXT("NO_CHANGE");O.Message=TEXT("noChange: Target already satisfies the verified plan; no transaction or write.");
+        Pending.Result=O;RememberRetry(MoveTemp(Pending));return O;
+    }
+    FGuid Owned;FString OwnedContext=TEXT("LandscapeMCP.V04.")+FGuid::NewGuid().ToString();
+    const FText Title=FText::FromString(TEXT("Landscape MCP v0.4 ")+O.Operation);
+    double WriteMs=0,FlushMs=0;
+    {
+        FScopedTransaction Transaction(*OwnedContext,Title,Target.Actor);
+        if(!Transaction.IsOutstanding()||!GUndo)return Failed(O,TEXT("TRANSACTION_FAILED"),TEXT("transaction"),TEXT("Could not start an owned transaction."));
+        Owned=GUndo->GetContext().TransactionId;
+        if(!Owned.IsValid()){Transaction.Cancel();return Failed(O,TEXT("TRANSACTION_FAILED"),TEXT("transaction"),TEXT("Owned transaction has no valid GUID."));}
+        Target.Actor->Modify();Target.Info->Modify();
+        const double WriteStart=FPlatformTime::Seconds();
+        {
+            FScopedSetLandscapeEditingLayer LayerScope(Target.Actor,Target.LayerGuid);
+            FLandscapeEditDataInterface EditData(Target.Info,Target.LayerGuid);
+            EditData.SetHeightData(Original.Rect.Min.X,Original.Rect.Min.Y,Original.Rect.Max.X,Original.Rect.Max.Y,Plan.Quantized.GetData(),0,false,
+                nullptr,nullptr,nullptr,false,nullptr,nullptr,true,true,true);
+            EditData.Flush();
+        }
+        WriteMs=(FPlatformTime::Seconds()-WriteStart)*1000;
+        const double FlushStart=FPlatformTime::Seconds();DerivedUpdate(Target);FlushMs=(FPlatformTime::Seconds()-FlushStart)*1000;
+    }
+    const double SourceStart=FPlatformTime::Seconds();FHeightfieldSnapshot Actual;FTarget PostTarget;FIdentity PostIdentity;FCollateral PostCollateral;
+    const bool FreshRead=!Fault(EApplyFault::FreshReadFailure)&&ReadSnapshot(R.LandscapePath,Min,Max,Actual,Code,Error);
+    if(Fault(EApplyFault::SourceMismatch)&&!Actual.Heights.IsEmpty())Actual.Heights[0]^=1;
+    const bool SourceOK=FreshRead&&Actual.Heights==Plan.Quantized
+        &&CaptureTarget(R.LandscapePath,PostTarget,PostIdentity,Code,Error)&&PostIdentity==Identity
+        &&CaptureCollateral(PostTarget,PostCollateral,Error)&&PostCollateral==Collateral;
+    const double SourceMs=(FPlatformTime::Seconds()-SourceStart)*1000;
+    const double GeometryStart=FPlatformTime::Seconds();
+    bool GeometryOK=SourceOK&&VerifyPreparedGeometry(R,Original,Actual,Plan,O)&&!Fault(EApplyFault::GeometryMismatch);
+    const double GeometryMs=(FPlatformTime::Seconds()-GeometryStart)*1000;
+    const double CollisionStart=FPlatformTime::Seconds();
+    const bool CollisionOK=GeometryOK&&CollisionMatches(PostTarget,Actual,Plan,Error,R.Operation==EAuthoringOperation::CreateWalkablePath?R.MaxSlope:0)&&!Fault(EApplyFault::CollisionFailure);
+    const double CollisionMs=(FPlatformTime::Seconds()-CollisionStart)*1000;
+    const bool ForceRollback=Fault(EApplyFault::UndoFalse)||Fault(EApplyFault::RestoreMismatch)||Fault(EApplyFault::RestoreCollisionFailure)||Fault(EApplyFault::RestoreCodecMismatch)||Fault(EApplyFault::RestoreCollisionStale)
+        ||Fault(EApplyFault::OwnershipMismatch)||Fault(EApplyFault::InsertUnrelatedTransaction);
+    const FTransactionContext BeforeCommit=GEditor->Trans->GetUndoContext();
+    const bool StillOwn=BeforeCommit.TransactionId==Owned&&BeforeCommit.Context==OwnedContext&&BeforeCommit.PrimaryObject==Target.Actor;
+    if(SourceOK&&GeometryOK&&CollisionOK&&StillOwn&&!ForceRollback)
+    {
+        O.Status=TEXT("APPLIED");O.bSuccess=true;O.ErrorCode.Reset();O.Message=TEXT("applied: Fresh source, geometry and native collision verified; one owned transaction; nothing saved.");
+        Pending.Result=O;RememberRetry(MoveTemp(Pending));
+        UE_LOG(LogTemp,Display,TEXT("LandscapeMCP timing planningMs=%.3f preWriteMs=%.3f writeMs=%.3f flushMs=%.3f postSourceMs=%.3f geometryMs=%.3f collisionMs=%.3f totalApplyMs=%.3f triangles=%d"),PlanningMs,PreMs,WriteMs,FlushMs,SourceMs,GeometryMs,CollisionMs,(FPlatformTime::Seconds()-ApplyStart)*1000,Plan.Core.Num());
+        return O;
+    }
+    const FString Failure=SourceOK?(GeometryOK?TEXT("COLLISION_SYNC_FAILED"):TEXT("POST_GEOMETRY_VERIFY_FAILED")):TEXT("POST_VERIFY_FAILED");
+    O=Failed(O,Failure,SourceOK?(GeometryOK?TEXT("postCollision"):TEXT("postGeometry")):TEXT("postSource"),Error.IsEmpty()?TEXT("Post verification failed."):Error);
+#if WITH_DEV_AUTOMATION_TESTS
+    if(Fault(EApplyFault::InsertUnrelatedTransaction))
+    {FScopedTransaction Other(TEXT("LandscapeMCP.Automation.Unrelated"),INVTEXT("Unrelated Automation transaction"),Target.Actor);Target.Actor->Modify();Target.Actor->SetActorLabel(TEXT("Automation unrelated label edit"));}
+#endif
+    const double RollbackStart=FPlatformTime::Seconds();
+    const FTransactionContext Latest=GEditor->Trans->GetUndoContext();
+    const bool Own=Owned.IsValid()&&!GEditor->IsTransactionActive()&&Latest.TransactionId==Owned&&Latest.Context==OwnedContext
+        &&Latest.Title.EqualTo(Title)&&Latest.PrimaryObject==Target.Actor&&!Fault(EApplyFault::OwnershipMismatch);
+    bool Restored=false;FString RestoreError=Own?FString():FString(TEXT("Ownership of the latest transaction could not be proved; no Undo was attempted."));
+    if(Own&&!Fault(EApplyFault::UndoFalse)&&GEditor->UndoTransaction(false))
+    {
+        DerivedUpdate(Target);
+        FTarget RestoredTarget;FIdentity RestoredIdentity;FCollateral RestoredCollateral;FHeightfieldSnapshot RestoredSource;
+        const bool RestoreRead=CaptureTarget(R.LandscapePath,RestoredTarget,RestoredIdentity,Code,RestoreError)
+            &&ReadSnapshot(R.LandscapePath,Min,Max,RestoredSource,Code,RestoreError);
+        if(Fault(EApplyFault::RestoreMismatch)&&!RestoredSource.Heights.IsEmpty())RestoredSource.Heights[0]^=1;
+#if WITH_DEV_AUTOMATION_TESTS
+        // Targeted fixture-only corruption of ACTUAL physics, never the expected
+        // model or source. Demonstrates true Undo is insufficient proof.
+        if(RestoreRead&&(Fault(EApplyFault::RestoreCodecMismatch)||Fault(EApplyFault::RestoreCollisionStale)))
+        {
+            auto* C=RestoredTarget.Actor->LandscapeComponents[0]->GetCollisionComponent();
+            if(C&&C->HeightfieldRef.IsValid()&&C->HeightfieldRef->HeightfieldGeometry.IsValid())
+            {
+                auto& H=*C->HeightfieldRef->HeightfieldGeometry;
+                if(Fault(EApplyFault::RestoreCollisionStale))H.GeomData.HeightPerUnit*=2;
+                else
+                {
+                    const int32 I=30*H.GetNumCols()+30;
+                    if(H.GeomData.Heights.IsValidIndex(I))H.GeomData.Heights[I]^=8192;
+                }
+                H.GeomData.BuildLowResolutionData();H.BoundingBox();
+            }
+        }
+#endif
+        Restored=RestoreRead&&RestoredIdentity==Identity&&SameSnapshot(Original,RestoredSource)
+            &&CaptureCollateral(RestoredTarget,RestoredCollateral,RestoreError)&&RestoredCollateral==Collateral
+            &&CollisionMatches(RestoredTarget,RestoredSource,Plan,RestoreError)&&!Fault(EApplyFault::RestoreCollisionFailure);
+    }
+    O.Status=Restored?TEXT("ROLLED_BACK"):TEXT("ROLLBACK_FAILED");O.RollbackStatus=Restored?TEXT("VERIFIED"):TEXT("FAILED");
+    if(!Restored){bMutationDisabled=true;O.Message+=TEXT("; restoreVerification: ")+(RestoreError.IsEmpty()?FString(TEXT("Restored source, identity, collateral or collision did not match the original, or Undo failed.")):RestoreError);O.Message+=TEXT("; rollback: Restoration could not be proved; v0.4 mutation disabled for this module session.");}
+    UE_LOG(LogTemp,Display,TEXT("LandscapeMCP rollback own=%d restored=%d elapsedMs=%.3f preWriteMs=%.3f writeMs=%.3f flushMs=%.3f postSourceMs=%.3f collisionMs=%.3f"),Own,Restored,(FPlatformTime::Seconds()-RollbackStart)*1000,PreMs,WriteMs,FlushMs,SourceMs,CollisionMs);
+    return O;
 }
 }
