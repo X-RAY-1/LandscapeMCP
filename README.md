@@ -9,7 +9,23 @@ Unreal Engine 5.8の公式Model Context Protocol（`ToolsetRegistry` → `ModelC
 - 現在のリリース: v0.4.0（実験的。Plugin descriptorでも`IsExperimentalVersion`を指定しています）
 - 配布形態: ソースのみ。Build済みのBinariesは配布していません
 
-<!-- TODO(media): Hero — CreateWalkablePathで斜面に歩ける道を通すGIF -->
+## デモ（v0.4）
+
+[![LandscapeMCP v0.4 demo: 丘を解析し、Dry-runで確認してから歩ける道をApplyし、遺跡を組み立てる](docs/media/landscapemcp_v04_ruin_demo.gif)](docs/media/landscapemcp_v04_ruin_demo.mp4)
+
+地形を解析し、変更をDry-runで安全に確認してから歩ける道をApplyし、その上にモジュール式の遺跡を組み立てるまでを、MCPから操作したUnreal Editorで記録したものです（約49秒）。字幕の数値はToolの実際の戻り値です。高画質版: [MP4（1920×1080）](docs/media/landscapemcp_v04_ruin_demo.mp4)
+
+| 道の帯（歩行可能角20度） | Before | After |
+|---|---|---|
+| 歩行可能な三角形 | 95 / 170（55.9%） | 170 / 170（100%） |
+| 最大傾斜 | 43.5度 | 19.4度 |
+
+- **解析**: `GetHeightRegion`、`AnalyzeSlopeNeighborhood`、`EvaluateWalkabilityRegion`
+- **`CreateWalkablePath`**: Dry-runで`PREVIEW_READY`（244頂点）→ Applyで`APPLIED`（244 / 244頂点）。実測が計画と一致し、rollbackは`NOT_NEEDED`。1回のApplyは1つのTransactionで、Undoで戻せます
+- **`FlattenRectangle`**: 階段の足元を同じくDry-run → Applyで整地
+- **安全性**: 対象は完全Object Pathで指定した1つのLandscapeだけ。条件を満たさない計画は書き込まずに拒否します（fail-closed）
+
+遺跡のmoduleの配置は、UE公式のEditor Toolsetで行っています。本Pluginの機能ではなく、遺跡のAssetも本リポジトリには含みません。
 
 ## 概要
 
