@@ -20,6 +20,7 @@ PIE／Save／GC中の操作、nested write transaction、入力・作成・編�
 - Heightmap適用Tool
 - 独立RebuildCollision Tool
 - World Partition／Proxy対応
+- Landscape Grass（Grass Output・Grass Type）を使うLandscapeへの編集（下の「Landscape Grass」を参照）
 - `NEAR_LIMIT`／`slopeUncertaintyDegrees`の名称見直し（schema互換性のため保留）
 
 ## 地形評価Toolの制限
@@ -71,6 +72,14 @@ GetHeightは元Heightfieldのbilinear値であり、Collision高さそのもの�
 - 付属の判定は、評価のたびに全LevelのFoliageの全instanceを走査します（上限なし）。数十万instance以上のWorldでは、1回の評価に数msから数十msかかる場合があります。
 - 閾値は固定です（高さは量子化の半段、傾斜は0.01度）。入力では変えられません。
 - Editor worldでは、読み込まれていないstreaming levelへの参照があっても、Editor自身が次のframeで読み込みます。拒否の判定はToolを呼んだ時点の状態で行います。
+
+## Landscape Grass
+
+v0.5.0では、Landscape Grass Output（またはGrass Type）を使うLandscapeへの編集は非対応です。
+
+- v0.4の3 ToolのApplyは`UNSUPPORTED_GRASS_STATE`で拒否します。Dry-runの`foliage`では`LANDSCAPE_GRASS`として`UNKNOWN`になります。
+- 円形ブラシの3 ToolはGrassの状態を検査しません（v0.3からの動作）。GrassはUEが地形の変更後に再生成するため、Grassのinstanceは保護も検証もされません。
+- 将来の検討事項（未実装・時期未定）: Grassを使うLandscapeへの安全な編集を、将来のバージョンで検討します。特定のバージョンでの実装は約束していません。
 
 ## 外部制約
 

@@ -237,6 +237,8 @@ Build Moduleの依存はCore、CoreUObject、Engine、ToolsetRegistry、Landscap
 
 BuildしたBinariesは、Buildに使ったEngineでだけ読み込めます。Engineを更新した場合はBuildし直してください。
 
+**Windowsのパス長の注意**: Windowsでは、ディレクトリのパスが長いとUnrealBuildToolや`RunUAT BuildPlugin`が失敗する場合があります（中間ファイルのパスが260文字の制限を超えるため）。Pluginの展開先、Projectの配置先、`-Package`の出力先には、`D:/Build/LMCP`のような短いパスを使ってください。長いパスで失敗した場合は、まず短いパスで再試行してください。
+
 ### Pluginの有効化と検出の確認
 
 1. `<Project>/Plugins/LandscapeMCP/`にPluginが置かれていることを確認し、Unreal Engine 5.8でProjectを開きます。
@@ -371,6 +373,13 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - Nanite Landscape、Visibility Holeは非対応
 - Foliageの扱いは[Foliage Safety](#foliage-safetyv05)のとおり。Landscape Grass、Procedural Foliage、Actor Foliage、他のLevelのFoliage、読み込まれていないstreaming levelは判定できないものとして扱い、地形authoringのApplyを拒否します
 
+**Landscape Grass（v0.5.0では非対応）**
+
+- Landscape Grass Output（またはGrass Type）を使うLandscapeへの編集は、v0.5.0では非対応です。
+- v0.4の3 ToolのApplyは、Grassの状態があるLandscapeを`UNSUPPORTED_GRASS_STATE`で拒否します。Dry-runの`foliage`ではGrassを判定できないもの（`LANDSCAPE_GRASS`）として扱い、`UNKNOWN`になります。
+- 円形ブラシの3 ToolはGrassの状態を検査しません。Grassは地形の変更後にUEが自動で再生成するため、本PluginはGrassのinstanceを保護も検証もしません。Grassを使うLandscapeでは使わないでください。
+- 将来の検討事項（未実装・時期未定）: Grassを使うLandscapeへの安全な編集を、将来のバージョンで検討しています。実装するバージョンや時期は決まっていません。
+
 **v0.4の3 ToolのApplyに追加で必要な条件**
 
 - collisionがHeightfieldと同じ解像度であること（Collision Mip LevelとSimple Collision Mip Levelが0、material position offsetのbakeなし）
@@ -394,7 +403,7 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - **中心傾斜は対称な地形で0になる**: 上の[中心傾斜と局所最大傾斜](#中心傾斜と局所最大傾斜)を参照してください。
 - **retryの冪等性には期限がある**: 上の[同じrequestの再送](#同じrequestの再送retry)を参照してください。
 - **別のUEバージョンは未検証**: UE5.8 / Win64 Editor以外では検証していません。三角形分割（対角線00-11）とcollisionの量子化は、UE5.8のEngineソースとline traceで確認したものです。
-- **未実装**: 経路探索、回転した矩形、不可歩行領域の自動修正、World Partition対応、Foliageを動かす・置き直す編集はありません。
+- **未実装**: 経路探索、回転した矩形、不可歩行領域の自動修正、World Partition対応、Landscape Grassを使うLandscapeへの編集、Foliageを動かす・置き直す編集はありません。
 - **Foliage Safetyの制限**: 円形ブラシは付属していないFoliageを保護しません。付属の判定は全instanceを走査します。上の[既知の制限](#foliage-safetyv05)を参照してください。
 
 全体は[制限一覧](docs/limitations.md)にあります。

@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 — Release Candidate（未リリース、2026-11-14）
+## v0.5.0 — 未リリース（RC1: 2026-11-14。公開日は公開時に記入）
 
 Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できるようにしました。Foliageを動かす・消す・置き直すApplyはありません。Foliageに影響する編集や、影響を判断できない編集は、書き込まずに拒否します。
 
@@ -43,6 +43,8 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - World Partition、Landscape Grassのあるmaterial、Procedural Foliage、Actor Foliage、他のLevelのFoliageがある範囲、読み込まれていないstreaming levelでは、地形authoringのApplyはできない
 - Foliageを動かして地形に合わせる編集はない
 - `GetHeight`などの読み取りToolの高さは、従来どおりbilinear補間（Foliage Safetyの高さの定義とは別）
+- Landscape Grass（Grass Output・Grass Type）を使うLandscapeへの編集は非対応。円形ブラシの3 ToolはGrassの状態を検査しない（v0.3からの動作）。安全な対応は将来のバージョンで検討中で、時期は未定
+- Windowsでは長いパスでBuildが失敗する場合がある。READMEのInstallationに注意を追加
 - 検証済みの環境はUnreal Engine 5.8 / Windows 64-bit
 
 詳細は`README.md`、`docs/v0.5-contract.md`、`docs/v0.5-design.md`、`docs/limitations.md`を参照してください。
