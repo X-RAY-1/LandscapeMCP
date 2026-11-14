@@ -47,6 +47,10 @@
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "LandscapeStreamingProxy.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInstanceConstant.h"
+#include "Materials/MaterialExpressionLandscapeGrassOutput.h"
+#include "Materials/MaterialExpressionMaterialAttributeLayers.h"
 
 // v0.5 Foliage Safety。Foliageを壊し得る操作は、ここで作る未保存Mapの中だけで行う。
 namespace LandscapeMCP::FoliageTests
@@ -1421,6 +1425,96 @@ bool FV05UnresolvedBase::RunTest(const FString&)
         TestTrue(Prefix+TEXT("still locked"),bool(Sub.Level->bLocked));
 #endif
         TestEqual(Prefix+TEXT("level count unchanged"),F.World->GetLevels().Num(),Levels);
+    }
+    return true;
+}
+
+// 円形ブラシ3 ToolのApplyは、Landscape Grassがある、またはmaterialの中を確かめられない場合に書き込まない（v0.5.0 RC2）。
+// Dry-runはv0.4の3 Toolと同じくGrassを検査せず成功する。Grassのないmaterialは従来どおり書き込める。
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV05BrushGrass,"LandscapeMCP.V05.Resolve.BrushGrassState",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FV05BrushGrass::RunTest(const FString&)
+{
+    enum class EKind{GrassOutput,GrassInstance,GrassComponents,LayeredInstance,AttachedAndGrass,PlainCustom,Default};
+    struct FCase{const TCHAR* Name;EKind Kind;bool bRefused;};
+    const FCase Cases[]={
+        {TEXT("grass output material"),EKind::GrassOutput,true},{TEXT("instance of grass material"),EKind::GrassInstance,true},
+        {TEXT("grass instance components"),EKind::GrassComponents,true},{TEXT("material layers via instance (not inspectable)"),EKind::LayeredInstance,true},
+        {TEXT("attached foliage and grass"),EKind::AttachedAndGrass,true},
+        {TEXT("custom material without grass"),EKind::PlainCustom,false},{TEXT("default material"),EKind::Default,false}};
+    for(const EOperation Op:{EOperation::Sculpt,EOperation::Smooth,EOperation::Flatten})
+    for(const FCase& C:Cases)
+    {
+        const FString Name=FString(OpName(Op))+TEXT(" / ")+C.Name;
+        FFixture F;if(!TestTrue(TEXT("fixture"),F.Valid()))return false;
+        // Smoothにも差が出るよう、Grassのないdefault materialのうちに凸を作る。
+        FEditRequest Bump=Brush(F.Path,EOperation::Sculpt,false);Bump.RadiusCm=600;Bump.Strength=200;
+        if(!TestTrue(Name+TEXT(": bump"),Edit(Bump).bSuccess))return false;
+        UMaterial* GrassMaterial=NewObject<UMaterial>(GetTransientPackage());
+        GrassMaterial->GetExpressionCollection().AddExpression(NewObject<UMaterialExpressionLandscapeGrassOutput>(GrassMaterial));
+        switch(C.Kind)
+        {
+        case EKind::GrassOutput:F.Actor->LandscapeMaterial=GrassMaterial;break;
+        case EKind::GrassInstance:{UMaterialInstanceConstant* MI=NewObject<UMaterialInstanceConstant>(GetTransientPackage());MI->Parent=GrassMaterial;F.Actor->LandscapeMaterial=MI;break;}
+        case EKind::GrassComponents:F.Actor->FoliageComponents.Add(NewObject<UHierarchicalInstancedStaticMeshComponent>(F.Actor));break;
+        case EKind::LayeredInstance:
+        {
+            UMaterial* Layered=NewObject<UMaterial>(GetTransientPackage());
+            Layered->GetExpressionCollection().AddExpression(NewObject<UMaterialExpressionMaterialAttributeLayers>(Layered));
+            UMaterialInstanceConstant* MI=NewObject<UMaterialInstanceConstant>(GetTransientPackage());MI->Parent=Layered;F.Actor->LandscapeMaterial=MI;break;
+        }
+        case EKind::AttachedAndGrass:F.Actor->LandscapeMaterial=GrassMaterial;F.Add(FVector(3000,3000,0));break;
+        case EKind::PlainCustom:F.Actor->LandscapeMaterial=NewObject<UMaterial>(GetTransientPackage());break;
+        case EKind::Default:break;
+        }
+        UMaterialInterface* const Material=F.Actor->LandscapeMaterial;const int32 GrassComponents=F.Actor->FoliageComponents.Num();
+        UPackage* Package=F.World->GetOutermost();Package->SetDirtyFlag(false);
+        const auto Original=F.Read();const TArray<FFoliageInstance> Foliage=F.Instances();const int32 Undo=UToolsetLibrary::GetActiveUndoCount();
+        const auto Dry=Edit(Brush(F.Path,Op,true));
+        if(C.Kind==EKind::AttachedAndGrass)
+        {
+            TestFalse(Name+TEXT(": dry run refused for the attached foliage"),Dry.bSuccess);
+            TestTrue(Name+TEXT(": dry run reason ")+Dry.Message,Dry.Message.Contains(TEXT("Attached foliage is unsupported")));
+        }
+        else
+        {
+            TestTrue(Name+TEXT(": dry run ")+Dry.Message,Dry.bSuccess);TestTrue(Name+TEXT(": dry run plans a change"),Dry.ChangedSampleCount>0);
+        }
+        TestTrue(Name+TEXT(": dry run heightmap unchanged"),F.Read().Heights==Original.Heights);
+        TestEqual(Name+TEXT(": dry run undo unchanged"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+        TestFalse(Name+TEXT(": dry run package not dirtied"),Package->IsDirty());
+        const auto Apply=Edit(Brush(F.Path,Op,false));
+        if(C.bRefused)
+        {
+            TestFalse(Name+TEXT(": apply refused"),Apply.bSuccess);
+            TestTrue(Name+TEXT(": reason ")+Apply.Message,Apply.Message.Contains(C.Kind==EKind::AttachedAndGrass?TEXT("Attached foliage is unsupported"):TEXT("UNSUPPORTED_GRASS_STATE")));
+            if(C.Kind==EKind::LayeredInstance)TestTrue(Name+TEXT(": not inspectable"),Apply.Message.Contains(TEXT("cannot be inspected")));
+            TestTrue(Name+TEXT(": heightmap unchanged"),F.Read().Heights==Original.Heights);
+            TestEqual(Name+TEXT(": undo history unchanged"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+            TestFalse(Name+TEXT(": package not dirtied"),Package->IsDirty());
+        }
+        else
+        {
+            TestTrue(Name+TEXT(": apply ")+Apply.Message,Apply.bSuccess);TestTrue(Name+TEXT(": written"),F.Read().Heights!=Original.Heights);
+            TestEqual(Name+TEXT(": one transaction"),UToolsetLibrary::GetActiveUndoCount(),Undo+1);
+            TestTrue(Name+TEXT(": undo"),GEditor->UndoTransaction(false));F.Actor->ForceUpdateLayersContent();
+            TestTrue(Name+TEXT(": undo restores heights"),F.Read().Heights==Original.Heights);
+        }
+        TestTrue(Name+TEXT(": material unchanged"),F.Actor->LandscapeMaterial==Material);
+        TestEqual(Name+TEXT(": grass components unchanged"),F.Actor->FoliageComponents.Num(),GrassComponents);
+        TestTrue(Name+TEXT(": foliage unchanged"),SameTransforms(F.Instances(),Foliage));
+        F.Actor->LandscapeMaterial=nullptr;F.Actor->FoliageComponents.Reset();
+    }
+    {
+        // 書き込みが不要な場合（平らな地面のSmooth）は、Grassがあっても書き込まずに成功する（v0.3からの動作）。
+        FFixture F;if(!TestTrue(TEXT("fixture"),F.Valid()))return false;
+        UMaterial* GrassMaterial=NewObject<UMaterial>(GetTransientPackage());
+        GrassMaterial->GetExpressionCollection().AddExpression(NewObject<UMaterialExpressionLandscapeGrassOutput>(GrassMaterial));
+        F.Actor->LandscapeMaterial=GrassMaterial;const int32 Undo=UToolsetLibrary::GetActiveUndoCount();const auto Original=F.Read();
+        const auto Apply=Edit(Brush(F.Path,EOperation::Smooth,false));
+        TestTrue(TEXT("flat smooth with grass: no write needed"),Apply.bSuccess&&Apply.ChangedSampleCount==0);
+        TestEqual(TEXT("flat smooth with grass: no transaction"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+        TestTrue(TEXT("flat smooth with grass: heights unchanged"),F.Read().Heights==Original.Heights);
+        F.Actor->LandscapeMaterial=nullptr;
     }
     return true;
 }

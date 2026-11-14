@@ -282,3 +282,19 @@ Automationが確認している主な内容（v0.5）:
 
 確認していないこと: UE5.8 / Win64 Editor以外の環境、`RunUAT BuildPlugin`によるv0.5.0のBuild、Levels panelで作った保存済みsublevelをGUIで非表示・unloadした状態での拒否（テストは同等の状態をEditor内で作って確認）、数十万instance以上のWorldでの所要時間。
 
+### RC2（円形ブラシのLandscape Grass判定、2026-11-14）
+
+PR #2のレビューで、円形ブラシ3 ToolがLandscape Grassを検査せずに書き込めることが分かりました。隔離ProjectでRC1のDLLを使って再現し（Grass Outputを持つmaterialとそのMaterial Instanceで、3 ToolのApplyが6件とも書き込んだ）、修正後に同じscriptで拒否されることを確認しました（[v0.5 contract §13.2](v0.5-contract.md)）。
+
+| 項目 | 結果 |
+|---|---|
+| Build（clean build） | 成功。警告はRC1と同じ（C4701が4件、既存のコード） |
+| Automation 92 suite | 92 Success、警告0、失敗0、未実行0（`V05.Resolve.BrushGrassState`を追加） |
+| MCP HTTPの往復 | v0.4・v0.5とも成功 |
+| Error / Ensure / Fatal | RC1と同じ（起動時のEngine側の19件だけ、Ensure 0、Fatal 0） |
+| Editorでの再現と修正の確認 | 修正前: Grassのある2構成 × 3 ToolのApplyが6件とも書き込み。修正後: 6件とも`UNSUPPORTED_GRASS_STATE`で拒否し、高さ・Undo・dirty・materialが不変。Dry-runはどちらも成功。Grassのない独自materialとdefault materialのApplyは、どちらも書き込みとUndoが成功 |
+| Editorでの代表ケース | 非表示sublevelの付属Foliageによる円形ブラシの拒否（6呼び出し）をRC2のDLLで再実行して成功 |
+| 性能（3回） | RC1と同じ範囲（上限に近いApplyが約100〜131ms） |
+
+`V05.Resolve.BrushGrassState`が確認していること: 3 Tool × 7構成（Grass Output、そのMaterial Instance、生成済みのGrassのcomponent、material layerのMaterial Instance、付属FoliageとGrassの両方、Grassのない独自material、default material）について、Dry-runの成功と不変性、Applyの拒否または成功、拒否時の高さ・Undo・dirtyの不変性、成功時のUndo、material・Grassのcomponent・Foliageの不変性。平らな地面のSmoothのように書き込みが不要な場合は、Grassがあっても書き込まずに成功すること。
+

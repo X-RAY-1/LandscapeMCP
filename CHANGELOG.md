@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 — 未リリース（RC1: 2026-11-14。公開日は公開時に記入）
+## v0.5.0 — 未リリース（RC2: 2026-11-14。公開日は公開時に記入）
 
 Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できるようにしました。Foliageを動かす・消す・置き直すApplyはありません。Foliageに影響する編集や、影響を判断できない編集は、書き込まずに拒否します。
 
@@ -20,6 +20,7 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - 書き込み後に、遅延していたLandscapeの更新を流してから、全LevelのFoliage Actorのbyte一致と、足元の地形が予測どおりであることを検証する。失敗時のrollbackも、Foliageを含めて元に戻ったことを確認する
 - 円形ブラシの3 Toolの付属Foliage判定を、非表示・ロック中のLevelと、付属先を証明できないinstanceまで広げた
 - 読み込まれていないstreaming levelがあるWorldでは、円形ブラシの書き込みを拒否する
+- 円形ブラシの3 ToolのApplyで、Landscape Grassの状態がある、またはmaterialの中を確かめられない（Material Instanceのmaterial layer、editor dataのないmaterial）Landscapeを拒否する（`message`の先頭が`UNSUPPORTED_GRASS_STATE:`）。v0.3からv0.5.0 RC1までは検査せずに書き込んでいた。Dry-runは検査しない。Grassのない独自materialは従来どおり編集できる。Grassの判定はv0.4の3 ToolのApplyと共通
 - 対象の解決で、同じLandscapeの別proxyとHeightmapの共有を、非表示Levelまで含めて確認する（v0.4.0では表示中のLevelだけを見ていた）
 
 ### Changed
@@ -34,7 +35,7 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - Foliageによる拒否は既存の`FOLIAGE_SAFETY_CONFLICT`。`message`の先頭に理由（`FOLIAGE_IMPACT`、`FOLIAGE_UNKNOWN`、`FOLIAGE_SNAP_MODE`、`FOLIAGE_STALE`、`FOLIAGE_POST_VERIFY`）を付ける
 - Toolset Versionを`0.4`から`0.5`へ、Plugin descriptorの`Version`を5、`VersionName`を`0.5.0`へ変更。Tool数は13から15へ増加
 - Build Moduleの依存は変更なし
-- Automationは60 suiteから91 suiteへ増加
+- Automationは60 suiteから92 suiteへ増加
 
 ### Limitations
 
@@ -43,7 +44,8 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - World Partition、Landscape Grassのあるmaterial、Procedural Foliage、Actor Foliage、他のLevelのFoliageがある範囲、読み込まれていないstreaming levelでは、地形authoringのApplyはできない
 - Foliageを動かして地形に合わせる編集はない
 - `GetHeight`などの読み取りToolの高さは、従来どおりbilinear補間（Foliage Safetyの高さの定義とは別）
-- Landscape Grass（Grass Output・Grass Type）を使うLandscapeへの編集は非対応。円形ブラシの3 ToolはGrassの状態を検査しない（v0.3からの動作）。安全な対応は将来のバージョンで検討中で、時期は未定
+- Landscape Grass（Grass Output・Grass Type）を使うLandscapeへの編集は非対応（Applyは拒否）。安全な対応は将来のバージョンで検討中で、時期は未定
+- Water System・Splineを使った川・道路などの検出、保護領域の設定、地形の変更に合わせた自動追従は非対応。関連するActorや形状が維持されることは保証しない。編集禁止領域、影響の評価、自動追従は将来の検討事項で、時期は未定
 - Windowsでは長いパスでBuildが失敗する場合がある。READMEのInstallationに注意を追加
 - 検証済みの環境はUnreal Engine 5.8 / Windows 64-bit
 

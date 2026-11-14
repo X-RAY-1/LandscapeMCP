@@ -36,7 +36,7 @@ ProjectにBuild済みPluginと公式ToolsetRegistryを有効化し、隔離さ�
   '-TestExit=Automation Test Queue Empty' '-ReportExportPath=<REPORT_DIR>'
 ```
 
-`LandscapeMCP`を指定すると、91 suiteすべて（`LandscapeMCP.V01.SafetyAndOperations`、`LandscapeMCP.V02.TerrainAnalysis`、`LandscapeMCP.V03.TerrainHardening`、`LandscapeMCP.V04.*`の57 suite、`LandscapeMCP.V05.*`の31 suite）を実行します。機能追加時は既存suiteも必ず再実行してください。
+`LandscapeMCP`を指定すると、92 suiteすべて（`LandscapeMCP.V01.SafetyAndOperations`、`LandscapeMCP.V02.TerrainAnalysis`、`LandscapeMCP.V03.TerrainHardening`、`LandscapeMCP.V04.*`の57 suite、`LandscapeMCP.V05.*`の32 suite）を実行します。機能追加時は既存suiteも必ず再実行してください。
 
 v0.4のsuiteには次の前提があります。
 

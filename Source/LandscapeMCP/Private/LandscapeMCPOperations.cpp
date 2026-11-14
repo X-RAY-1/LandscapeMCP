@@ -21,6 +21,7 @@
 #include "LandscapeHeightfieldCollisionComponent.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionLandscapeGrassOutput.h"
+#include "Materials/MaterialExpressionMaterialAttributeLayers.h"
 #include "Serialization/ObjectWriter.h"
 #include "Misc/Crc.h"
 #include "GameFramework/WorldSettings.h"
@@ -164,6 +165,37 @@ namespace
         FVector Scale;
         FVector Origin;
     };
+    // Landscape Grassを使わないことを確かめられるか。GrassはUEが地形の変更後にTransactionの外で再生成するため、
+    // instance単位で保護も検証もできない。Grassの状態がある、またはmaterialの中身を確かめられない場合はfalse。
+    bool MaterialGrassFree(const UMaterialInterface* M,FString& Error)
+    {
+        const UMaterial* Base=M?M->GetMaterial():nullptr;
+        if(!Base||!Base->GetEditorOnlyData())
+        {Error=TEXT("The Landscape material graph cannot be inspected for Landscape Grass Output.");return false;}
+        TArray<UMaterialExpressionLandscapeGrassOutput*> Grass;Base->GetAllExpressionsInMaterialAndFunctionsOfType(Grass);
+        if(!Grass.IsEmpty()){Error=TEXT("Landscape Grass Output is present.");return false;}
+        // Material Instanceはmaterial layerの関数を差し替えられる。差し替え後の関数は確かめないため、layerを使う構成は判定不能とする。
+        TArray<UMaterialExpressionMaterialAttributeLayers*> Layers;Base->GetAllExpressionsInMaterialAndFunctionsOfType(Layers);
+        if(!Layers.IsEmpty()&&M!=Base)
+        {Error=TEXT("Material layers of a Material Instance cannot be inspected for Landscape Grass Output.");return false;}
+        return true;
+    }
+    bool GrassFree(const ALandscape* A,FString& Error)
+    {
+        if(!A->GetGrassTypesOverrides().IsEmpty()||!A->FoliageComponents.IsEmpty()||!A->AsyncFoliageTasks.IsEmpty())
+        {Error=TEXT("Landscape Grass state is present (grass type overrides or grass instance components).");return false;}
+        TArray<const UMaterialInterface*> Materials{A->GetLandscapeMaterial()};
+        for(const FLandscapePerLODMaterialOverride& O:A->GetPerLODOverrideMaterials())if(O.Material)Materials.Add(O.Material);
+        for(const ULandscapeComponent* C:A->LandscapeComponents)
+        {
+            if(!C){Error=TEXT("Missing Landscape component.");return false;}
+            if(!C->GetNamedGrassTypes().IsEmpty()){Error=TEXT("Landscape component has grass types.");return false;}
+            Materials.Add(C->GetLandscapeMaterial());
+            for(const FLandscapePerLODMaterialOverride& O:C->GetPerLODOverrideMaterials())if(O.Material)Materials.Add(O.Material);
+        }
+        for(const UMaterialInterface* M:Materials)if(!MaterialGrassFree(M,Error))return false;
+        return true;
+    }
     // Read: Foliageが付いていても解決する（LandscapeもFoliageも変更しない用途）。
     // Write: 付属Foliageを拒否する（事後検証のない円形ブラシの書き込み）。
     // v0.4 Toolの書き込みはReadで解決し、Foliage gateで別に判定する。
@@ -633,6 +665,8 @@ FLandscapeMCPResult Edit(const FEditRequest& R)
     Result.WorldMax = FVector(T.Origin.X+Rect.Max.X*T.Scale.X,T.Origin.Y+Rect.Max.Y*T.Scale.Y,MaxZ);
     Result.Message = TEXT("Validated complete edit; deltas include heightfield quantization; nothing saved.");
     if (R.bDryRun || Result.ChangedSampleCount == 0) { return Result; }
+    // Dry-runはv0.4の3 Toolと同じくGrassを検査しない。書き込む場合だけ拒否する。
+    if (!GrassFree(T.Actor,Error)) { return Fail(TEXT("UNSUPPORTED_GRASS_STATE: ")+Error,R.LandscapePath); }
     if (GEditor->IsTransactionActive()) { return Fail(TEXT("Nested write transactions are unsupported."),R.LandscapePath); }
     {
         FScopedTransaction Transaction(INVTEXT("Landscape MCP Heightfield Edit"));
@@ -1067,17 +1101,13 @@ namespace
         // Deliberately narrow allowlist. Material Instances, custom materials,
         // LOD overrides and grass caches are refused, including unknown graphs.
         UMaterial* Default=UMaterial::GetDefaultMaterial(MD_Surface);
-        if(!Default||!Default->GetEditorOnlyData()||T.Actor->GetLandscapeMaterial()!=Default
-            ||!T.Actor->GetPerLODOverrideMaterials().IsEmpty()||!T.Actor->GetGrassTypesOverrides().IsEmpty()
-            ||!T.Actor->FoliageComponents.IsEmpty()||!T.Actor->AsyncFoliageTasks.IsEmpty())
+        if(!Default||T.Actor->GetLandscapeMaterial()!=Default||!T.Actor->GetPerLODOverrideMaterials().IsEmpty())
         {Error=TEXT("Only the inspectable engine default material without grass state is supported for Apply.");return false;}
-        TArray<UMaterialExpressionLandscapeGrassOutput*> Grass;
-        Default->GetAllExpressionsInMaterialAndFunctionsOfType(Grass);
-        if(!Grass.IsEmpty()){Error=TEXT("Landscape Grass Output is present.");return false;}
         for(ULandscapeComponent* C:T.Actor->LandscapeComponents)
-            if(C->GetLandscapeMaterial()!=Default||!C->GetPerLODOverrideMaterials().IsEmpty()||!C->GetNamedGrassTypes().IsEmpty())
+            if(C->GetLandscapeMaterial()!=Default||!C->GetPerLODOverrideMaterials().IsEmpty())
             {Error=TEXT("Component material override or grass state is unsupported.");return false;}
-        return true;
+        // Grassの状態の判定は円形ブラシと共通。
+        return GrassFree(T.Actor,Error);
     }
     bool CaptureTarget(const FString& Path,FTarget& T,FIdentity& I,FString& Code,FString& Error)
     {

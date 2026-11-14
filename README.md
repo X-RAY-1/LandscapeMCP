@@ -168,7 +168,7 @@ v0.5は、Foliageを壊さないことを優先しています。Foliageを書�
 
 **円形ブラシの3 Tool（`SculptRegion`、`SmoothRegion`、`FlattenRegion`）**
 
-v0.4と同じく、対象Landscapeに付属したFoliageがあれば、Dry-runもApplyも拒否します。v0.5では、非表示・ロック中のLevelにあるFoliageと、付属先を証明できないinstanceも付属として扱います。読み込まれていないstreaming levelがあるWorldでは、書き込みを拒否します。
+v0.4と同じく、対象Landscapeに付属したFoliageがあれば、Dry-runもApplyも拒否します。v0.5では、非表示・ロック中のLevelにあるFoliageと、付属先を証明できないinstanceも付属として扱います。読み込まれていないstreaming levelがあるWorldでは、書き込みを拒否します。Landscape Grassがある、またはmaterialの中を確かめられないLandscapeへのApplyも拒否します（下の[Limitations](#limitations)の「Landscape Grass」）。
 
 **読み取りTool**
 
@@ -377,8 +377,17 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 
 - Landscape Grass Output（またはGrass Type）を使うLandscapeへの編集は、v0.5.0では非対応です。
 - v0.4の3 ToolのApplyは、Grassの状態があるLandscapeを`UNSUPPORTED_GRASS_STATE`で拒否します。Dry-runの`foliage`ではGrassを判定できないもの（`LANDSCAPE_GRASS`）として扱い、`UNKNOWN`になります。
-- 円形ブラシの3 ToolはGrassの状態を検査しません。Grassは地形の変更後にUEが自動で再生成するため、本PluginはGrassのinstanceを保護も検証もしません。Grassを使うLandscapeでは使わないでください。
+- 円形ブラシの3 Tool（`SculptRegion`、`SmoothRegion`、`FlattenRegion`）のApplyも、Grassの状態があるLandscapeを拒否します。`message`の先頭は`UNSUPPORTED_GRASS_STATE:`です。Dry-runはGrassを検査せず、v0.4の3 Toolと同じく成功します。書き込みが不要な場合（変化0）は、従来どおり何も書き込まずに成功します。
+- Grassの状態として扱うもの: material（Material Instanceの親、Material Functionの中を含む）のLandscape Grass Output、ActorのGrass Type override、Componentのgrass type、生成済みのGrassのcomponentと非同期task。
+- materialの中を確かめられない構成も、Grassがないと証明できないため拒否します: material layerを使うmaterialのMaterial Instance（layerの差し替え先を確かめないため）、editor dataのないmaterial。
+- Grassを使わない独自materialのLandscapeは、円形ブラシで従来どおり編集できます（v0.4の3 ToolのApplyは、従来どおりEngineのdefault materialだけ）。GrassはUEが地形の変更後に再生成するため、本PluginはGrassのinstanceを保護も検証もしません。
 - 将来の検討事項（未実装・時期未定）: Grassを使うLandscapeへの安全な編集を、将来のバージョンで検討しています。実装するバージョンや時期は決まっていません。
+
+**Water System・Spline・保護領域（v0.5.0では非対応）**
+
+- v0.5.0は、Unreal EngineのWater SystemやSplineを使った川・道路などの自動検出、保護領域（編集禁止領域）の設定、地形の変更に合わせた自動追従をサポートしていません。これらを検出・保護・追従する機能はありません。
+- これらを含む地形について、LandscapeMCPは関連するActorや形状が適切に維持されることを保証しません。川岸、道路、橋、建物などに影響する地形の編集は避けてください。
+- 将来の検討事項（未実装・時期未定）: 編集禁止領域の設定、Water System・Splineへの影響の評価、安全な自動追従を、段階的に検討します。実装するバージョンや時期は決まっていません。
 
 **v0.4の3 ToolのApplyに追加で必要な条件**
 
@@ -403,7 +412,7 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - **中心傾斜は対称な地形で0になる**: 上の[中心傾斜と局所最大傾斜](#中心傾斜と局所最大傾斜)を参照してください。
 - **retryの冪等性には期限がある**: 上の[同じrequestの再送](#同じrequestの再送retry)を参照してください。
 - **別のUEバージョンは未検証**: UE5.8 / Win64 Editor以外では検証していません。三角形分割（対角線00-11）とcollisionの量子化は、UE5.8のEngineソースとline traceで確認したものです。
-- **未実装**: 経路探索、回転した矩形、不可歩行領域の自動修正、World Partition対応、Landscape Grassを使うLandscapeへの編集、Foliageを動かす・置き直す編集はありません。
+- **未実装**: 経路探索、回転した矩形、不可歩行領域の自動修正、World Partition対応、Landscape Grassを使うLandscapeへの編集、Water System・Splineの検出・保護・自動追従、保護領域の設定、Foliageを動かす・置き直す編集はありません。
 - **Foliage Safetyの制限**: 円形ブラシは付属していないFoliageを保護しません。付属の判定は全instanceを走査します。上の[既知の制限](#foliage-safetyv05)を参照してください。
 
 全体は[制限一覧](docs/limitations.md)にあります。
@@ -417,7 +426,7 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - [開発手順](docs/development.md): 構成、Build、Automationの実行方法
 - [検証要約](docs/testing.md): これまでに行った検証の範囲と結果
 
-Automation Testは91 suiteあります。
+Automation Testは92 suiteあります。
 
 | suite | 対象 |
 |---|---|
@@ -425,7 +434,7 @@ Automation Testは91 suiteあります。
 | `LandscapeMCP.V02.TerrainAnalysis` | 傾斜・領域の高さ・歩行可能性・量子化誤差の上限・read-only |
 | `LandscapeMCP.V03.TerrainHardening` | 実三角形・近傍解析・領域の歩行可能性・Collisionの三角形分割の確認 |
 | `LandscapeMCP.V04.*`（57 suite） | v0.4の3 Tool: 計画、公式schema、Dry-runの不変性、Apply、Undo／Redo、retry、fault注入によるrollbackとlatch、collisionの量子化、prop、保存と副作用がないこと、MCPの往復 |
-| `LandscapeMCP.V05.*`（31 suite） | Foliage Safety: 影響の分類と実三角形の高さ、collisionとの照合、Foliageなし・範囲外・範囲内、Undo／Redoと複数frame後、非表示・ロック中・別Level・未ロードのLevel、Actor Foliage・Procedural・Grass、snap mode、走査上限、書き込み直前の再確認、事後検証とrollback、円形ブラシの付属判定、読み取りToolの不変性、v0.4.0のschemaとの互換、HTTPとPythonからの呼び出し |
+| `LandscapeMCP.V05.*`（32 suite） | Foliage Safety: 影響の分類と実三角形の高さ、collisionとの照合、Foliageなし・範囲外・範囲内、Undo／Redoと複数frame後、非表示・ロック中・別Level・未ロードのLevel、Actor Foliage・Procedural・Grass、snap mode、走査上限、書き込み直前の再確認、事後検証とrollback、円形ブラシの付属判定とGrass判定、読み取りToolの不変性、v0.4.0のschemaとの互換、HTTPとPythonからの呼び出し |
 
 Automationは新しい未保存Mapを作り、Undo履歴も使います。作業中のEditorではなく、検証用の別Projectで実行してください。実行方法と前提は[開発手順](docs/development.md)にあります。
 
