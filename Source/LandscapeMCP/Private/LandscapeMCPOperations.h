@@ -28,4 +28,7 @@ namespace LandscapeMCP
     FLandscapeMCPWalkabilityResult Walkability(const FString& Path, double X, double Y, double WalkableFloorAngleDeg, double SampleDistanceCm);
     FLandscapeMCPSlopeNeighborhoodResult SlopeNeighborhood(const FString& Path, double X, double Y, double RadiusCm, double SampleDistanceCm);
     FLandscapeMCPWalkabilityRegionResult WalkabilityRegion(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, double WalkableFloorAngleDeg);
+    // 以下も読み取り専用。Foliage付きのLandscapeでも、LandscapeとFoliageを変更しない。
+    FLandscapeMCPFoliageInspectResult FoliageInspect(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, int32 MaxInstances);
+    FLandscapeMCPCapabilitiesResult Capabilities();
 }

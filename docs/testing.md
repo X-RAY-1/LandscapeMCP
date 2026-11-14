@@ -256,3 +256,29 @@ Automationが確認している主な内容:
 測定した所要時間の例（Ryzen 7 7800X3D、UE5.8 Editor。保証値ではありません）: 幅4m・長さ30m程度の編集のApplyが約6ms、同じrequestの再送が約1ms、上限に近い大きさ（読み取り16384頂点、検証する三角形 約3万枚）のApplyが約100〜140ms。
 
 確認していないこと: UE5.8 / Win64 Editor以外の環境、`RunUAT BuildPlugin`によるv0.4.0のBuild、CharacterMovementやNavMeshでの通行と`CreateWalkablePath`の結果の対応（環境に依存します）、256個を超えるpropがある場合の拒否。
+
+## v0.5.0の検証（2026-11-14、Release Candidate）
+
+Foliage Safetyを追加したv0.5.0の検証です。Buildは、検証用の隔離ProjectへPluginをソースごと置き、Binaries・Intermediateを消してからUnrealBuildTool（UnrealEditor / Win64 / Development）で行いました。
+
+| 項目 | 結果 |
+|---|---|
+| Build（UE5.8.3、Win64 Development Editor、clean build） | 成功 |
+| Automation 91 suite | 91 Success、警告0、失敗0、未実行0（v0.4の60 suite、v0.5の31 suite） |
+| MCP HTTPの往復 | v0.4の往復（Dry-run、Apply、retry、診断、rollback、latch）と、v0.5の往復（`GetCapabilities`、`InspectFoliage`の成功と異常系、Foliage付きの`FlattenRectangle`のDry-runとApplyの拒否）の両方が成功 |
+| 公式schema | Version `0.5`、15 Tool。既存13 Toolは、v0.4.0のtagと比べて、3 Toolの出力`foliage`の追加以外の差なし |
+| Error / Ensure / Fatal | 起動時の`LogAutomationTest: Error: Condition failed` 19件だけ。LandscapeMCPを含まない空Projectでも同じ19件が出るEngine側のもの。Ensure 0、Fatal 0 |
+| Editorでの代表ケース | 非表示sublevelの付属Foliageによる円形ブラシの拒否（6呼び出し）、Foliageのある範囲のApplyの拒否、安全なApply → Undo → Redo（各60 frame後にFoliage不変、高さが元に戻る・再適用される）、読み込まれていないstreaming levelでの書き込みの拒否（円形ブラシ6呼び出しと`FlattenRectangle`）、snap mode（`SnapUnderBrushOnly`、`SnapEverywhere`）による拒否。すべて成功。拒否の前後で地形・Foliage・Undo・dirty・Level状態・保存済みAssetが不変 |
+
+Automationが確認している主な内容（v0.5）:
+
+- **影響の評価**: 実三角形の高さ（bilinearとの違いの反例を含む）、辺・対角線・頂点、Snapshotの端、量子化と傾斜の閾値（直下・一致・直上）、実collisionとの照合
+- **Apply**: Foliageなし・範囲外・範囲内、Undo／Redoと遅延更新、実際のEditor tickでの複数frame後、境界をまたぐ編集、20,000 instance、走査上限ちょうどと超過
+- **判定できない形式と状態**: 非表示・ロック中・別Level・読み込まれていないLevel、Actor Foliage、Procedural、Grass、snap mode、付属先を証明できないinstance（cacheのentry欠損、null、解決できない参照、無効なcomponent、ComponentHashとの不整合）
+- **書き込み直前と書き込み後**: 状態の変化による`preWrite`での拒否、Foliageを本当に動かすfaultでの`postFoliage`、Undoで戻る場合のrollbackと、戻らない場合の`ROLLBACK_FAILED`とlatch
+- **読み取りと互換性**: Foliage付きLandscapeでの読み取りToolの不変性、v0.4.0のschemaとの比較、ToolsetRegistryとPythonからの呼び出し
+
+測定した所要時間の例（Ryzen 7 7800X3D、UE5.8 Editor。保証値ではありません）: 上限に近い大きさのApplyが約100〜130ms、64点の経路の計画が約70ms、範囲外に20,000 instanceがある場合のDry-runが約0.3ms・Applyが約20ms。
+
+確認していないこと: UE5.8 / Win64 Editor以外の環境、`RunUAT BuildPlugin`によるv0.5.0のBuild、Levels panelで作った保存済みsublevelをGUIで非表示・unloadした状態での拒否（テストは同等の状態をEditor内で作って確認）、数十万instance以上のWorldでの所要時間。
+
