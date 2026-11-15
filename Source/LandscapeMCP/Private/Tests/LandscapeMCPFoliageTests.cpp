@@ -51,6 +51,9 @@
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialExpressionLandscapeGrassOutput.h"
 #include "Materials/MaterialExpressionMaterialAttributeLayers.h"
+#include "Materials/MaterialExpressionMaterialFunctionCall.h"
+#include "Materials/MaterialFunction.h"
+#include "Materials/MaterialFunctionInstance.h"
 
 // v0.5 Foliage Safety。Foliageを壊し得る操作は、ここで作る未保存Mapの中だけで行う。
 namespace LandscapeMCP::FoliageTests
@@ -1515,6 +1518,296 @@ bool FV05BrushGrass::RunTest(const FString&)
         TestEqual(TEXT("flat smooth with grass: no transaction"),UToolsetLibrary::GetActiveUndoCount(),Undo);
         TestTrue(TEXT("flat smooth with grass: heights unchanged"),F.Read().Heights==Original.Heights);
         F.Actor->LandscapeMaterial=nullptr;
+    }
+    return true;
+}
+
+// v0.5.0 RC3: Grassの判定に使うmaterialとmaterial functionのgraph、Grass判定から書き込みまでの間の状態変化。
+namespace LandscapeMCP::FoliageTests
+{
+    // graphを作る。expressionにはEditorで作る場合と同じく、所有元へのback-pointerを付ける。
+    UMaterial* NewMaterial(){return NewObject<UMaterial>(GetTransientPackage());}
+    UMaterialFunction* NewFunction(){return NewObject<UMaterialFunction>(GetTransientPackage());}
+    template<class TExpr> TExpr* AddTo(UMaterial* M){TExpr* E=NewObject<TExpr>(M);E->Material=M;M->GetExpressionCollection().AddExpression(E);return E;}
+    template<class TExpr> TExpr* AddTo(UMaterialFunction* F){TExpr* E=NewObject<TExpr>(F);E->Function=F;F->GetExpressionCollection().AddExpression(E);return E;}
+    template<class TOwner> void CallFrom(TOwner* Owner,UMaterialFunctionInterface* Callee){AddTo<UMaterialExpressionMaterialFunctionCall>(Owner)->MaterialFunction=Callee;}
+    UMaterial* MaterialCalling(UMaterialFunctionInterface* Callee){UMaterial* M=NewMaterial();CallFrom(M,Callee);return M;}
+    UMaterialFunction* GrassFunction(){UMaterialFunction* F=NewFunction();AddTo<UMaterialExpressionLandscapeGrassOutput>(F);return F;}
+    UMaterialInstanceConstant* InstanceOf(UMaterialInterface* Parent){UMaterialInstanceConstant* I=NewObject<UMaterialInstanceConstant>(GetTransientPackage());I->Parent=Parent;return I;}
+    UMaterialFunctionInstance* FunctionInstanceOf(UMaterialFunctionInterface* Parent)
+    {UMaterialFunctionInstance* I=NewObject<UMaterialFunctionInstance>(GetTransientPackage());I->Parent=Parent;I->Base=Parent?Parent->GetBaseFunctionInterface():nullptr;return I;}
+    // Material Layersの最初のslotにfunctionを入れる（UEの既定は空の背景layer）。
+    UMaterial* LayeredMaterial(UMaterialFunctionInterface* Layer)
+    {
+        UMaterial* M=NewMaterial();auto* L=AddTo<UMaterialExpressionMaterialAttributeLayers>(M);
+        if(Layer){if(L->DefaultLayers.Layers.IsEmpty())L->DefaultLayers.Layers.Add(Layer);else L->DefaultLayers.Layers[0]=Layer;}
+        return M;
+    }
+    // editor dataのないmaterial・function（cook済みや破損したassetと同じ形）。
+    bool DropEditorData(UObject* O)
+    {
+        UClass* Owner=O->IsA<UMaterialFunctionInterface>()?UMaterialFunctionInterface::StaticClass():UMaterialInterface::StaticClass();
+        FObjectPropertyBase* P=FindFProperty<FObjectPropertyBase>(Owner,TEXT("EditorOnlyData"));
+        if(!P)return false;P->SetObjectPropertyValue_InContainer(O,nullptr);return true;
+    }
+    // materialが解析で変わっていないことの目印（親、expressionの数、editor data）。親が循環するMaterial Instanceは
+    // serializeが戻らない（UEの動作。修正前の再現で確認）ため、Hash()ではなくfieldを直接読む。
+    uint64 Fingerprint(const UMaterialInterface* M)
+    {
+        if(const UMaterialInstance* I=Cast<UMaterialInstance>(M))return uint64(UPTRINT(I->Parent.Get()));
+        const UMaterial* Base=Cast<UMaterial>(M);if(!Base)return 0;const UMaterialInterface* Data=Base;
+        return HashCombine(GetTypeHash(Data->GetEditorOnlyData()),Data->GetEditorOnlyData()?GetTypeHash(Base->GetExpressions().Num()):0);
+    }
+    // 円形ブラシ3 ToolのApplyを、materialを差し替えたLandscapeで実行する。materialは凸を作った後に差し替える（Smoothにも差が出る）。
+    // RefusedReasonがnullなら書き込みとUndoの成功、それ以外は書き込まずに拒否されることを確かめる。
+    void BrushMaterialCase(FAutomationTestBase& Test,const FString& Case,TFunctionRef<UMaterialInterface*()> Make,const TCHAR* RefusedReason)
+    {
+        for(const EOperation Op:{EOperation::Sculpt,EOperation::Smooth,EOperation::Flatten})
+        {
+            const FString Name=FString(OpName(Op))+TEXT(" / ")+Case;
+            FFixture F;if(!Test.TestTrue(Name+TEXT(": fixture"),F.Valid()))return;
+            FEditRequest Bump=Brush(F.Path,EOperation::Sculpt,false);Bump.RadiusCm=600;Bump.Strength=200;
+            if(!Test.TestTrue(Name+TEXT(": bump"),Edit(Bump).bSuccess))return;
+            UMaterialInterface* const Material=Make();F.Actor->LandscapeMaterial=Material;const uint64 MaterialPrint=Fingerprint(Material);
+            UPackage* Package=F.World->GetOutermost();Package->SetDirtyFlag(false);
+            const auto Original=F.Read();const int32 Undo=UToolsetLibrary::GetActiveUndoCount();
+            const auto Dry=Edit(Brush(F.Path,Op,true));
+            Test.TestTrue(Name+TEXT(": dry run ")+Dry.Message,Dry.bSuccess&&Dry.ChangedSampleCount>0);
+            const auto Apply=Edit(Brush(F.Path,Op,false));
+            if(RefusedReason)
+            {
+                Test.TestFalse(Name+TEXT(": apply refused"),Apply.bSuccess);
+                Test.TestTrue(Name+TEXT(": reason ")+Apply.Message,Apply.Message.StartsWith(TEXT("UNSUPPORTED_GRASS_STATE"))&&Apply.Message.Contains(RefusedReason));
+                Test.TestTrue(Name+TEXT(": heightmap unchanged"),F.Read().Heights==Original.Heights);
+                Test.TestEqual(Name+TEXT(": undo history unchanged"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+                Test.TestFalse(Name+TEXT(": package not dirtied"),Package->IsDirty());
+            }
+            else
+            {
+                Test.TestTrue(Name+TEXT(": apply ")+Apply.Message,Apply.bSuccess);Test.TestTrue(Name+TEXT(": written"),F.Read().Heights!=Original.Heights);
+                Test.TestEqual(Name+TEXT(": one transaction"),UToolsetLibrary::GetActiveUndoCount(),Undo+1);
+                Test.TestTrue(Name+TEXT(": undo"),GEditor->UndoTransaction(false));F.Actor->ForceUpdateLayersContent();
+                Test.TestTrue(Name+TEXT(": undo restores heights"),F.Read().Heights==Original.Heights);
+            }
+            Test.TestTrue(Name+TEXT(": material unchanged"),F.Actor->LandscapeMaterial==Material&&Fingerprint(Material)==MaterialPrint);
+            Test.TestTrue(Name+TEXT(": no grass components"),F.Actor->FoliageComponents.IsEmpty());
+            F.Actor->LandscapeMaterial=nullptr;
+        }
+    }
+    constexpr const TCHAR* NotInspectable=TEXT("cannot be inspected");
+    constexpr const TCHAR* GrassPresent=TEXT("Landscape Grass Output is present");
+}
+namespace LandscapeMCP::FoliageTests
+{
+    // M1の構成。IDの頭文字: U=判定不能、H=修正前のDLLで無限再帰・editor dataの欠損によりEditorが停止し得る判定不能、
+    // G=Grassの検出（RC2で検出できていた形の回帰確認）、A=解析でき、Grassがない（拒否しない）。
+    // 修正前の再現では、1件ずつ別processで実行できるよう、caseごとに名前を分ける（BrushMaterialGraph.<ID>）。
+    struct FGraphCase{const TCHAR* Id;const TCHAR* Description;UMaterialInterface*(*Make)(FAutomationTestBase&);const TCHAR* Reason;};
+    const TArray<FGraphCase>& GraphCases()
+    {
+        static const TArray<FGraphCase> Cases={
+            {TEXT("U1_NullCall"),TEXT("function call without a function"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {UMaterial* M=NewMaterial();AddTo<UMaterialExpressionMaterialFunctionCall>(M);return M;},NotInspectable},
+            {TEXT("U2_InstanceNoParent"),TEXT("material instance without a parent"),+[](FAutomationTestBase&)->UMaterialInterface*{return InstanceOf(nullptr);},NotInspectable},
+            {TEXT("U3_InstanceCycle"),TEXT("material instance parent cycle"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {UMaterialInstanceConstant* A=InstanceOf(nullptr);A->Parent=InstanceOf(A);return A;},NotInspectable},
+            {TEXT("U4_InstanceChainNoParent"),TEXT("instance of an instance without a parent"),+[](FAutomationTestBase&)->UMaterialInterface*{return InstanceOf(InstanceOf(nullptr));},NotInspectable},
+            {TEXT("U5_FunctionInstanceNoParent"),TEXT("function instance without a parent"),+[](FAutomationTestBase&)->UMaterialInterface*{return MaterialCalling(FunctionInstanceOf(nullptr));},NotInspectable},
+            {TEXT("U6_FunctionInstanceCycle"),TEXT("function instance parent cycle"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {UMaterialFunctionInstance* A=FunctionInstanceOf(nullptr);A->Parent=FunctionInstanceOf(A);return MaterialCalling(A);},NotInspectable},
+            {TEXT("U7_NestedNullCall"),TEXT("nested call without a function"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {UMaterialFunction* F=NewFunction();AddTo<UMaterialExpressionMaterialFunctionCall>(F);return MaterialCalling(F);},NotInspectable},
+            {TEXT("H1_CallCycle"),TEXT("function call cycle"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {UMaterialFunction* A=NewFunction();UMaterialFunction* B=NewFunction();CallFrom(A,B);CallFrom(B,A);return MaterialCalling(A);},NotInspectable},
+            {TEXT("H2_SelfCall"),TEXT("function calling itself"),+[](FAutomationTestBase&)->UMaterialInterface*{UMaterialFunction* A=NewFunction();CallFrom(A,A);return MaterialCalling(A);},NotInspectable},
+            {TEXT("H3_NestedNoEditorData"),TEXT("nested function without editor data"),+[](FAutomationTestBase& T)->UMaterialInterface*
+                {UMaterialFunction* Inner=NewFunction();UMaterialFunction* Outer=NewFunction();CallFrom(Outer,Inner);T.TestTrue(TEXT("editor data dropped"),DropEditorData(Inner));return MaterialCalling(Outer);},NotInspectable},
+            {TEXT("H4_FunctionNoEditorData"),TEXT("called function without editor data"),+[](FAutomationTestBase& T)->UMaterialInterface*
+                {UMaterialFunction* F=NewFunction();T.TestTrue(TEXT("editor data dropped"),DropEditorData(F));return MaterialCalling(F);},NotInspectable},
+            {TEXT("H5_MaterialNoEditorData"),TEXT("material without editor data"),+[](FAutomationTestBase& T)->UMaterialInterface*
+                {UMaterial* M=NewMaterial();T.TestTrue(TEXT("editor data dropped"),DropEditorData(M));return M;},NotInspectable},
+            {TEXT("G1_NestedGrass"),TEXT("grass in a nested function"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {UMaterialFunction* F=NewFunction();CallFrom(F,GrassFunction());return MaterialCalling(F);},GrassPresent},
+            {TEXT("G2_SharedGrass"),TEXT("grass in a shared function"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {UMaterialFunction* S=GrassFunction();UMaterialFunction* A=NewFunction();UMaterialFunction* B=NewFunction();CallFrom(A,S);CallFrom(B,S);UMaterial* M=MaterialCalling(A);CallFrom(M,B);return M;},GrassPresent},
+            {TEXT("G3_FunctionInstanceGrass"),TEXT("grass behind a function instance"),+[](FAutomationTestBase&)->UMaterialInterface*{return MaterialCalling(FunctionInstanceOf(GrassFunction()));},GrassPresent},
+            {TEXT("G4_LayerGrass"),TEXT("grass in a layer function"),+[](FAutomationTestBase&)->UMaterialInterface*{return LayeredMaterial(GrassFunction());},GrassPresent},
+            {TEXT("A1_NestedClean"),TEXT("nested functions without grass"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {UMaterialFunction* F=NewFunction();CallFrom(F,NewFunction());return MaterialCalling(F);},nullptr},
+            {TEXT("A2_SharedDagClean"),TEXT("shared function DAG without grass"),+[](FAutomationTestBase&)->UMaterialInterface*
+            {
+                UMaterialFunction* S=NewFunction();UMaterialFunction* A=NewFunction();UMaterialFunction* B=NewFunction();
+                CallFrom(A,S);CallFrom(A,S);CallFrom(B,S);UMaterial* M=MaterialCalling(A);CallFrom(M,B);CallFrom(M,S);return M;
+            },nullptr},
+            {TEXT("A3_InstanceChainClean"),TEXT("instance chain without grass"),+[](FAutomationTestBase&)->UMaterialInterface*{return InstanceOf(InstanceOf(NewMaterial()));},nullptr},
+            {TEXT("A4_FunctionInstanceClean"),TEXT("function instance chain without grass"),+[](FAutomationTestBase&)->UMaterialInterface*
+                {return MaterialCalling(FunctionInstanceOf(FunctionInstanceOf(NewFunction())));},nullptr},
+            {TEXT("A5_LayersEmptySlot"),TEXT("material layers with an empty slot"),+[](FAutomationTestBase&)->UMaterialInterface*{return LayeredMaterial(nullptr);},nullptr},
+            {TEXT("A6_LayersClean"),TEXT("material layers with a layer without grass"),+[](FAutomationTestBase&)->UMaterialInterface*{return LayeredMaterial(NewFunction());},nullptr}};
+        return Cases;
+    }
+}
+// M1: 列挙結果が空なだけでは「Grassなし」としない。未解決の参照・循環・editor dataの欠損は判定不能として拒否し、
+// 解析できたGrassのないgraph（入れ子、共有DAG、instance、空のlayer slot）は拒否しない。
+IMPLEMENT_COMPLEX_AUTOMATION_TEST(FV05BrushMaterialGraph,"LandscapeMCP.V05.Resolve.BrushMaterialGraph",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+void FV05BrushMaterialGraph::GetTests(TArray<FString>& OutBeautifiedNames,TArray<FString>& OutTestCommands)const
+{
+    for(const FGraphCase& C:GraphCases()){OutBeautifiedNames.Add(C.Id);OutTestCommands.Add(C.Id);}
+}
+bool FV05BrushMaterialGraph::RunTest(const FString& Parameters)
+{
+    for(const FGraphCase& C:GraphCases())
+        if(Parameters==C.Id){BrushMaterialCase(*this,C.Description,[&]{return C.Make(*this);},C.Reason);return true;}
+    AddError(TEXT("Unknown case: ")+Parameters);return false;
+}
+
+namespace LandscapeMCP::FoliageTests
+{
+    // UObject::Modify()の通知で同期実行されるlistener（material等を自動で変えるEditor拡張の代わり）。条件に合う最初の通知で1回だけ状態を変える。
+    struct FModifyListener
+    {
+        FDelegateHandle Handle;int32 Fired=0;
+        FModifyListener(TFunction<bool(UObject*)> Match,TFunction<void()> Change)
+        {
+            Handle=FCoreUObjectDelegates::OnObjectModified.AddLambda([this,Match=MoveTemp(Match),Change=MoveTemp(Change)](UObject* O)
+                {if(Fired==0&&Match(O)){++Fired;Change();}});
+        }
+        ~FModifyListener(){FCoreUObjectDelegates::OnObjectModified.Remove(Handle);}
+    };
+    UMaterial* GrassMaterial(){UMaterial* M=NewMaterial();AddTo<UMaterialExpressionLandscapeGrassOutput>(M);return M;}
+}
+// M2: Grass判定の後、Actor/InfoのModify通知や書き込み中の通知でmaterial・Grassの状態が変わった場合は、
+// 書き込まない（書き込み前）か、所有するtransactionをUndoして成功を返さない（書き込み後）。
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV05BrushGrassReentry,"LandscapeMCP.V05.Resolve.BrushGrassReentry",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FV05BrushGrassReentry::RunTest(const FString&)
+{
+    enum class ETrigger{Actor,Info,DuringWrite};
+    enum class EChange{None,GrassMaterial,GrassInPlace,ComponentOverride,GrassComponents};
+    struct FCase{const TCHAR* Name;ETrigger Trigger;EChange Change;bool bRestoreFault=false;};
+    const FCase Cases[]={
+        {TEXT("Actor.Modify sets a grass material"),ETrigger::Actor,EChange::GrassMaterial},
+        {TEXT("Actor.Modify adds grass output to the same material"),ETrigger::Actor,EChange::GrassInPlace},
+        {TEXT("Info.Modify sets a component override with grass"),ETrigger::Info,EChange::ComponentOverride},
+        {TEXT("Info.Modify adds grass instance components"),ETrigger::Info,EChange::GrassComponents},
+        {TEXT("during the write: grass material"),ETrigger::DuringWrite,EChange::GrassMaterial},
+        {TEXT("during the write: grass instance components"),ETrigger::DuringWrite,EChange::GrassComponents},
+        {TEXT("during the write: grass material, restoration not provable (fault)"),ETrigger::DuringWrite,EChange::GrassMaterial,true},
+        {TEXT("Actor.Modify without a change (control)"),ETrigger::Actor,EChange::None}};
+    for(const EOperation Op:{EOperation::Sculpt,EOperation::Smooth,EOperation::Flatten})
+    for(const FCase& C:Cases)
+    {
+        const FString Name=FString(OpName(Op))+TEXT(" / ")+C.Name;
+        FFixture F;if(!TestTrue(TEXT("fixture"),F.Valid()))return false;
+        FEditRequest Bump=Brush(F.Path,EOperation::Sculpt,false);Bump.RadiusCm=600;Bump.Strength=200;
+        if(!TestTrue(Name+TEXT(": bump"),Edit(Bump).bSuccess))return false;
+        // Grassのないcustom material（Apply可）から始める。
+        UMaterial* const Plain=NewMaterial();F.Actor->LandscapeMaterial=Plain;
+        ALandscape* const Actor=F.Actor;ULandscapeInfo* const Info=Actor->GetLandscapeInfo();
+        UPackage* Package=F.World->GetOutermost();Package->SetDirtyFlag(false);
+        const auto Original=F.Read();const int32 Undo=UToolsetLibrary::GetActiveUndoCount();
+        UMaterialInterface* Expected=Plain;
+        auto Change=[&]()
+        {
+            switch(C.Change)
+            {
+            case EChange::None:break;
+            case EChange::GrassMaterial:Expected=GrassMaterial();Actor->LandscapeMaterial=Expected;break;
+            case EChange::GrassInPlace:AddTo<UMaterialExpressionLandscapeGrassOutput>(Plain);break;
+            case EChange::ComponentOverride:Actor->LandscapeComponents[0]->OverrideMaterial=GrassMaterial();break;
+            case EChange::GrassComponents:Actor->FoliageComponents.Add(NewObject<UHierarchicalInstancedStaticMeshComponent>(Actor));break;
+            }
+        };
+        // 書き込み中: InfoのModify（書き込み前の最後のModify）の後に来る、Landscapeの部品（componentやheightmap）のModify通知。
+        // Actor->Modify()はroot componentもModifyするので、Actorの後ではなくInfoの後から数える。
+        bool bArmed=false;TArray<FString> Seen;
+        FModifyListener Listener([&](UObject* O)
+        {
+            if(O==Actor||O==Info){bArmed|=O==Info;return C.Trigger==(O==Actor?ETrigger::Actor:ETrigger::Info);}
+            Seen.Add(O->GetClass()->GetName());
+            return C.Trigger==ETrigger::DuringWrite&&bArmed&&O->IsIn(Actor);
+        },Change);
+        // UEは同じframeの2回目以降のModify通知を送らない（ObjectsModifiedThisFrame）。Testは1 frameの中で凸を作った直後なので、
+        // Engineがframeの終わりに行うのと同じく集合を空にして、次のframeでのApplyと同じ通知の状態にする。
+        FCoreUObjectDelegates::ObjectsModifiedThisFrame.Empty();
+        SetAutomationBrushRestoreFailure(C.bRestoreFault);
+        const auto Apply=Edit(Brush(F.Path,Op,false));
+        SetAutomationBrushRestoreFailure(false);
+        AddInfo(Name+TEXT(": modified during apply: ")+FString::Join(Seen,TEXT(","))+TEXT(" / ")+Apply.Message);
+        TestEqual(Name+TEXT(": listener fired"),Listener.Fired,1);
+        if(C.Change==EChange::None)
+        {
+            TestTrue(Name+TEXT(": apply ")+Apply.Message,Apply.bSuccess);TestTrue(Name+TEXT(": written"),F.Read().Heights!=Original.Heights);
+            TestEqual(Name+TEXT(": one transaction"),UToolsetLibrary::GetActiveUndoCount(),Undo+1);
+            TestTrue(Name+TEXT(": undo"),GEditor->UndoTransaction(false));Actor->ForceUpdateLayersContent();
+            TestTrue(Name+TEXT(": undo restores heights"),F.Read().Heights==Original.Heights);
+        }
+        else
+        {
+            TestFalse(Name+TEXT(": apply refused"),Apply.bSuccess);
+            TestTrue(Name+TEXT(": reason ")+Apply.Message,Apply.Message.StartsWith(TEXT("UNSUPPORTED_GRASS_STATE")));
+            TestTrue(Name+TEXT(": heightmap unchanged or restored"),F.Read().Heights==Original.Heights);
+            TestEqual(Name+TEXT(": no undo record left"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+            if(C.Trigger!=ETrigger::DuringWrite)
+            {
+                TestTrue(Name+TEXT(": nothing written"),Apply.Message.Contains(TEXT("nothing was written")));
+                TestFalse(Name+TEXT(": package not dirtied"),Package->IsDirty());
+            }
+            else if(!C.bRestoreFault)TestTrue(Name+TEXT(": rolled back"),Apply.Message.Contains(TEXT("rollback completed")));
+            else TestTrue(Name+TEXT(": rollback not provable"),Apply.Message.Contains(TEXT("rollback FAILED")));
+            if(C.Trigger!=ETrigger::DuringWrite)
+            {
+                // 書き込む前の拒否: このToolは、listenerが変えた状態をさらに変えたり、元に戻したりしない。
+                TestTrue(Name+TEXT(": material is the listener's"),Actor->LandscapeMaterial==Expected);
+            }
+            else
+            {
+                // 書き込み後のrollback: ActorはこのToolのtransactionに記録済みなので、そのtransactionの中でlistenerが
+                // Actorに加えた変更も、UndoでApply前の状態に戻る（UEのUndoの動作）。Grassのcomponentも残らない。
+                TestTrue(Name+TEXT(": actor restored by undo"),Actor->LandscapeMaterial==Plain);
+                TestTrue(Name+TEXT(": no grass components after undo"),Actor->FoliageComponents.IsEmpty());
+            }
+        }
+        // 後片付け。書き込み後に復元を証明できなかった場合は、後続の円形ブラシの書き込みも止まっている。
+        Actor->LandscapeMaterial=Plain;Plain->GetExpressionCollection().Empty();Actor->LandscapeComponents[0]->OverrideMaterial=nullptr;Actor->FoliageComponents.Reset();
+        const auto Next=Edit(Brush(F.Path,Op,false));
+        if(C.bRestoreFault)
+        {
+            TestFalse(Name+TEXT(": later brush writes stopped"),Next.bSuccess);
+            TestTrue(Name+TEXT(": latch reason ")+Next.Message,Next.Message.StartsWith(TEXT("BRUSH_WRITES_DISABLED")));
+            ResetAutomationApplyState();
+        }
+        else if(C.Change!=EChange::None)TestTrue(Name+TEXT(": later write allowed ")+Next.Message,Next.bSuccess);
+        if(Next.bSuccess)GEditor->UndoTransaction(false);
+        Actor->LandscapeMaterial=nullptr;
+    }
+    // v0.4の3 Tool（FlattenRectangleで代表）: 書き込み直前の再検証。v0.4のApplyはdefault materialだけを許す。
+    for(const bool bChange:{true,false})
+    {
+        const FString Name=bChange?TEXT("FlattenRectangle / Actor.Modify sets a grass material"):TEXT("FlattenRectangle / Actor.Modify without a change (control)");
+        FFixture F;if(!TestTrue(TEXT("fixture"),F.Valid()))return false;
+        ALandscape* const Actor=F.Actor;UPackage* Package=F.World->GetOutermost();Package->SetDirtyFlag(false);
+        const auto Original=F.Read();const int32 Undo=UToolsetLibrary::GetActiveUndoCount();UMaterial* Grass=GrassMaterial();
+        FModifyListener Listener([&](UObject* O){return O==Actor;},[&]{if(bChange)Actor->LandscapeMaterial=Grass;});
+        FCoreUObjectDelegates::ObjectsModifiedThisFrame.Empty();   // 次のframeと同じ通知の状態（上を参照）
+        FString Stage;const auto O=Execute(F.Rect(100,false),&Stage);
+        TestEqual(Name+TEXT(": listener fired"),Listener.Fired,1);
+        if(bChange)
+        {
+            TestFalse(Name+TEXT(": refused"),O.bSuccess);
+            TestEqual(Name+TEXT(": code ")+O.Message,O.ErrorCode,FString(TEXT("UNSUPPORTED_GRASS_STATE")));
+            TestEqual(Name+TEXT(": stage"),Stage,FString(TEXT("transaction")));
+            TestEqual(Name+TEXT(": no rollback needed"),O.RollbackStatus,FString(TEXT("NOT_NEEDED")));
+            TestTrue(Name+TEXT(": heightmap unchanged"),F.Read().Heights==Original.Heights);
+            TestEqual(Name+TEXT(": undo history unchanged"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+            TestFalse(Name+TEXT(": package not dirtied"),Package->IsDirty());
+            TestFalse(Name+TEXT(": mutation still enabled"),MutationDisabled());
+        }
+        else
+        {
+            TestTrue(Name+TEXT(": applied ")+O.Message,O.bSuccess&&O.Status==TEXT("APPLIED"));
+            TestTrue(Name+TEXT(": package dirtied by the write"),Package->IsDirty());
+        }
+        Actor->LandscapeMaterial=nullptr;
     }
     return true;
 }

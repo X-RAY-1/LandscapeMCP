@@ -280,7 +280,7 @@ Automationが確認している主な内容（v0.5）:
 
 測定した所要時間の例（Ryzen 7 7800X3D、UE5.8 Editor。保証値ではありません）: 上限に近い大きさのApplyが約100〜130ms、64点の経路の計画が約70ms、範囲外に20,000 instanceがある場合のDry-runが約0.3ms・Applyが約20ms。
 
-確認していないこと: UE5.8 / Win64 Editor以外の環境、`RunUAT BuildPlugin`によるv0.5.0のBuild、Levels panelで作った保存済みsublevelをGUIで非表示・unloadした状態での拒否（テストは同等の状態をEditor内で作って確認）、数十万instance以上のWorldでの所要時間。
+確認していないこと（RC1の時点）: UE5.8 / Win64 Editor以外の環境、`RunUAT BuildPlugin`によるv0.5.0のBuild（RC2・RC3で確認済み。下の表を参照）、Levels panelで作った保存済みsublevelをGUIで非表示・unloadした状態での拒否（テストは同等の状態をEditor内で作って確認）、数十万instance以上のWorldでの所要時間。
 
 ### RC2（円形ブラシのLandscape Grass判定、2026-11-14）
 
@@ -295,6 +295,38 @@ PR #2のレビューで、円形ブラシ3 ToolがLandscape Grassを検査せず
 | Editorでの再現と修正の確認 | 修正前: Grassのある2構成 × 3 ToolのApplyが6件とも書き込み。修正後: 6件とも`UNSUPPORTED_GRASS_STATE`で拒否し、高さ・Undo・dirty・materialが不変。Dry-runはどちらも成功。Grassのない独自materialとdefault materialのApplyは、どちらも書き込みとUndoが成功 |
 | Editorでの代表ケース | 非表示sublevelの付属Foliageによる円形ブラシの拒否（6呼び出し）をRC2のDLLで再実行して成功 |
 | 性能（3回） | RC1と同じ範囲（上限に近いApplyが約100〜131ms） |
+| `RunUAT BuildPlugin`（Win64） | `BUILD SUCCESSFUL`、終了コード0（RC2のsource） |
 
 `V05.Resolve.BrushGrassState`が確認していること: 3 Tool × 7構成（Grass Output、そのMaterial Instance、生成済みのGrassのcomponent、material layerのMaterial Instance、付属FoliageとGrassの両方、Grassのない独自material、default material）について、Dry-runの成功と不変性、Applyの拒否または成功、拒否時の高さ・Undo・dirtyの不変性、成功時のUndo、material・Grassのcomponent・Foliageの不変性。平らな地面のSmoothのように書き込みが不要な場合は、Grassがあっても書き込まずに成功すること。
+
+### RC3（Grass判定の完全性と書き込み直前・直後の再検証、2026-11-15）
+
+独立レビュー（MAJOR 2件、MINOR 1件）を受けて、Grassの判定をmaterialのgraphの完全な解析に変え、判定から書き込みまでの状態変化を再検証するようにしました（[v0.5 contract §13.3](v0.5-contract.md)）。反例は、修正前のRC2 DLL（製品sourceは`e37ec16`のまま、テストだけ追加）で1構成ずつ別processとtimeoutを使って再現し、同じテストを修正後のDLLで実行しました。
+
+| 項目 | 修正前（RC2のDLL） | 修正後（RC3） |
+|---|---|---|
+| 判定不能なgraph（親のないMaterial Instance・Function Instance、関数のないFunction Call、親の循環、関数の呼び出しの循環、入れ子のfunctionのeditor dataの欠損） | 10構成 × 3 ToolのApplyが30件とも書き込み | 30件とも書き込まずに拒否。高さ・Undo・dirty・materialが不変 |
+| 入れ子・共有のMaterial Functionの中のGrass Output | 2構成 × 3 Toolの6件とも書き込み（UEの列挙APIが入れ子を見ないため） | 6件とも拒否 |
+| 呼び出すfunctionのeditor dataの欠損 | Editorが停止（`CastChecked`のFatal error） | 拒否 |
+| Function Instanceの中・layerの中のGrass、rootのeditor dataの欠損 | 拒否（RC2で検出できていた） | 拒否 |
+| 解析できるGrassのないgraph（入れ子、共有DAG、instanceの連鎖、空のlayer slot） | 書き込みとUndoが成功 | 書き込みとUndoが成功 |
+| `Actor`・`Info`の`Modify`通知でmaterial・Grassの状態を変える（4構成 × 3 Tool） | 12件とも書き込んで成功を返した | 12件とも書き込まずに拒否。高さ・Undo・dirtyが不変 |
+| 書き込み中の通知で状態を変える（2構成 × 3 Tool） | 6件とも書き込んで成功を返した | 6件ともUndoして拒否（`rollback completed`）。高さが元に戻り、Undoの記録も残らない |
+| 復元を確かめられない場合（automationのfault） | — | `rollback FAILED`で拒否し、以後の円形ブラシのApplyを`BRUSH_WRITES_DISABLED`で拒否 |
+| v0.4の`FlattenRectangle`で`Modify`通知が状態を変える | 書き込んでから事後検証でrollback | 書き込まずに`UNSUPPORTED_GRASS_STATE`（`stage`は`transaction`）で拒否 |
+
+| 項目 | 結果 |
+|---|---|
+| Build（clean build） | 成功。警告はRC1・RC2と同じ（C4701が4件） |
+| Automation | 115件すべてSuccess、警告0、失敗0、未実行0（`V05.Resolve.BrushMaterialGraph`の22構成と`V05.Resolve.BrushGrassReentry`を追加） |
+| MCP HTTPの往復 | v0.4・v0.5とも成功 |
+| Error / Ensure / Fatal | RC2と同じ（起動時のEngine側の19件だけ、Ensure 0、Fatal 0） |
+| 性能（3回） | 上限に近いApplyが約99〜100ms、64点の経路の計画が約65〜67ms、20,000 instanceのApplyが約20〜22ms（RC2と同じ範囲） |
+| `RunUAT BuildPlugin`（Win64） | `BUILD SUCCESSFUL`、終了コード0 |
+
+再現の途中で、次のことが分かりました（証跡に残しています）。
+
+- UEは同じframeの2回目以降の`OnObjectModified`を送りません。最初の試行ではテストのlistenerが呼ばれず、M2を再現できませんでした。テストは、Engineがframeの終わりに行うのと同じく通知済みの集合を空にしてからApplyします。
+- 親が循環するMaterial Instanceは、serializeが戻りません。テストのhashが原因でEditorが応答しなくなったため、テストはfieldを直接読む目印に変えました（製品の解析はserializeしません）。
+- 修正後の最初のテストで、自分自身を呼ぶMaterial Functionを見逃していました（所有元へのback-pointerを値で除いていたため）。propertyで除くように直し、テストで確認しました。
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 — 未リリース（RC2: 2026-11-14。公開日は公開時に記入）
+## v0.5.0 — 未リリース（RC3: 2026-11-15。公開日は公開時に記入）
 
 Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できるようにしました。Foliageを動かす・消す・置き直すApplyはありません。Foliageに影響する編集や、影響を判断できない編集は、書き込まずに拒否します。
 
@@ -21,6 +21,8 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - 円形ブラシの3 Toolの付属Foliage判定を、非表示・ロック中のLevelと、付属先を証明できないinstanceまで広げた
 - 読み込まれていないstreaming levelがあるWorldでは、円形ブラシの書き込みを拒否する
 - 円形ブラシの3 ToolのApplyで、Landscape Grassの状態がある、またはmaterialの中を確かめられない（Material Instanceのmaterial layer、editor dataのないmaterial）Landscapeを拒否する（`message`の先頭が`UNSUPPORTED_GRASS_STATE:`）。v0.3からv0.5.0 RC1までは検査せずに書き込んでいた。Dry-runは検査しない。Grassのない独自materialは従来どおり編集できる。Grassの判定はv0.4の3 ToolのApplyと共通
+- Grassの判定（RC3）: materialとmaterial functionのgraphを、Material Instance・Function Instanceの親、Function Call、material layerを含めて最後まで辿る。UEの列挙APIが飛ばす未解決の参照（親のないinstance、関数のないFunction Call）、参照の循環、editor dataの欠損、解析の上限の超過は判定不能として拒否する。RC2では、入れ子のMaterial Functionの中のGrass Outputを見逃し、未解決・循環する構成をGrassなしとして書き込んでいた（修正前のDLLで再現）
+- 書き込み直前・直後の再検証（RC3）: `Modify`の同期通知などでmaterial・Grassの状態が判定後に変わった場合、円形ブラシとv0.4の3 Toolは書き込まずに拒否する。円形ブラシで書き込み後に変わった場合は、所有するtransactionをUndoして拒否し、復元を確かめられなければ以後の円形ブラシの書き込みを止める（`BRUSH_WRITES_DISABLED:`）
 - 対象の解決で、同じLandscapeの別proxyとHeightmapの共有を、非表示Levelまで含めて確認する（v0.4.0では表示中のLevelだけを見ていた）
 
 ### Changed
@@ -35,7 +37,7 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - Foliageによる拒否は既存の`FOLIAGE_SAFETY_CONFLICT`。`message`の先頭に理由（`FOLIAGE_IMPACT`、`FOLIAGE_UNKNOWN`、`FOLIAGE_SNAP_MODE`、`FOLIAGE_STALE`、`FOLIAGE_POST_VERIFY`）を付ける
 - Toolset Versionを`0.4`から`0.5`へ、Plugin descriptorの`Version`を5、`VersionName`を`0.5.0`へ変更。Tool数は13から15へ増加
 - Build Moduleの依存は変更なし
-- Automationは60 suiteから92 suiteへ増加
+- Automationは60 suiteから115件へ増加（`V05.Resolve.BrushMaterialGraph`の22構成を1件ずつ数える）
 
 ### Limitations
 

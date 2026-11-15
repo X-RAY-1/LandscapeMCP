@@ -80,8 +80,9 @@ v0.5.0では、Landscape Grass Output（またはGrass Type）を使うLandscape
 
 - v0.4の3 ToolのApplyは`UNSUPPORTED_GRASS_STATE`で拒否します。Dry-runの`foliage`では`LANDSCAPE_GRASS`として`UNKNOWN`になります。
 - 円形ブラシの3 ToolのApplyも、Grassの状態がある、またはmaterialの中を確かめられないLandscapeを拒否します（`message`の先頭が`UNSUPPORTED_GRASS_STATE:`。v0.5.0 RC2で追加。v0.3〜v0.5.0 RC1は検査していませんでした）。Dry-runは検査しません。
-- Grassの状態: material（Material Instanceの親、Material Functionの中を含む）のLandscape Grass Output、ActorのGrass Type override、Componentのgrass type、生成済みのGrassのcomponentと非同期task。
-- 確かめられない構成として拒否するもの: material layerを使うmaterialのMaterial Instance、editor dataのないmaterial。
+- Grassの状態: material（Material Instanceの親、Material Function・Function Instance・material layerの関数を、入れ子や共有も含めて最後まで辿る）のLandscape Grass Output、ActorのGrass Type override、Componentのgrass type、生成済みのGrassのcomponentと非同期task。
+- 確かめられない構成として拒否するもの（v0.5.0 RC3で拡大）: 親のないMaterial Instance・Material Function Instance、関数を指定していないFunction Call、参照の循環（Material Instanceの親、関数の呼び出し）、editor dataのないmaterial・material function、解析の上限（参照の深さ64、material・function 4096、expression 262,144）の超過、material layerを使うmaterialのMaterial Instance（layerの差し替え先を確かめないため）。空のlayer slotや、LODの上書きの空slotは拒否しません。解析は読み取りだけで、materialを変更・修復しません。
+- 判定の後も、書き込む直前と書き込んだ直後に、Grassの状態とmaterialが判定時と同じことを確かめます。Editor拡張などが`Modify`の通知の中でmaterialやGrassの状態を変えた場合、書き込む前なら何も書き込まずに拒否し、書き込んだ後なら本Pluginのtransactionを1件だけUndoして拒否します（`message`はどちらも`UNSUPPORTED_GRASS_STATE:`で始まります）。Undoの後に高さが元に戻り、Grassのinstanceが生成されていないことを確かめられない場合は、成功を返さず、そのmodule sessionの間は円形ブラシの書き込みを止めます（`BRUSH_WRITES_DISABLED:`）。
 - Grassのない独自materialは、円形ブラシで編集できます。GrassはUEが地形の変更後に再生成するため、Grassのinstanceは保護も検証もされません。
 - 将来の検討事項（未実装・時期未定）: Grassを使うLandscapeへの安全な編集を、将来のバージョンで検討します。特定のバージョンでの実装は約束していません。
 

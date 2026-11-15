@@ -22,6 +22,10 @@ namespace LandscapeMCP
         int32 CountX, int32 CountY, int32 Sections, int32 Quads, double InitialHeight, bool bDryRun);
     FLandscapeMCPResult Height(const FString& Path, double X, double Y);
     FLandscapeMCPResult Edit(const FEditRequest& Request);
+#if WITH_DEV_AUTOMATION_TESTS
+    // Automation専用: 円形ブラシのrollbackで、復元の確認を失敗扱いにする（latchの検証用）。ResetAutomationApplyStateで解除。
+    void SetAutomationBrushRestoreFailure(bool bFail);
+#endif
     // 以下は読み取り専用。Transaction、Modify、Package dirty化を行わない。
     FLandscapeMCPSlopeResult Slope(const FString& Path, double X, double Y, double SampleDistanceCm);
     FLandscapeMCPHeightRegionResult HeightRegion(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, double SpacingCm);

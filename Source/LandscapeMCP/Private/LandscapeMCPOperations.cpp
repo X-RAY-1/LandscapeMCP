@@ -22,6 +22,11 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionLandscapeGrassOutput.h"
 #include "Materials/MaterialExpressionMaterialAttributeLayers.h"
+#include "Materials/MaterialExpressionMaterialFunctionCall.h"
+#include "Materials/MaterialFunction.h"
+#include "Materials/MaterialFunctionInstance.h"
+#include "Materials/MaterialInstance.h"
+#include "UObject/UnrealType.h"
 #include "Serialization/ObjectWriter.h"
 #include "Misc/Crc.h"
 #include "GameFramework/WorldSettings.h"
@@ -167,34 +172,146 @@ namespace
     };
     // Landscape Grassを使わないことを確かめられるか。GrassはUEが地形の変更後にTransactionの外で再生成するため、
     // instance単位で保護も検証もできない。Grassの状態がある、またはmaterialの中身を確かめられない場合はfalse。
-    bool MaterialGrassFree(const UMaterialInterface* M,FString& Error)
+    //
+    // materialとmaterial functionのgraphを最後まで自分で辿る。UEの列挙APIは解決できない参照を黙って飛ばすため、
+    // 「見つからなかった」を「Grassがない」の証明に使わない。親や関数の参照が解決できない、editor dataがない、
+    // 参照が循環する、上限を超える場合は判定不能とする。読み取りだけで、objectの変更・ロード・修復はしない。
+    struct FGrassGraphWalk
     {
-        const UMaterial* Base=M?M->GetMaterial():nullptr;
-        if(!Base||!Base->GetEditorOnlyData())
-        {Error=TEXT("The Landscape material graph cannot be inspected for Landscape Grass Output.");return false;}
-        TArray<UMaterialExpressionLandscapeGrassOutput*> Grass;Base->GetAllExpressionsInMaterialAndFunctionsOfType(Grass);
-        if(!Grass.IsEmpty()){Error=TEXT("Landscape Grass Output is present.");return false;}
-        // Material Instanceはmaterial layerの関数を差し替えられる。差し替え後の関数は確かめないため、layerを使う構成は判定不能とする。
-        TArray<UMaterialExpressionMaterialAttributeLayers*> Layers;Base->GetAllExpressionsInMaterialAndFunctionsOfType(Layers);
-        if(!Layers.IsEmpty()&&M!=Base)
-        {Error=TEXT("Material layers of a Material Instance cannot be inspected for Landscape Grass Output.");return false;}
-        return true;
-    }
-    bool GrassFree(const ALandscape* A,FString& Error)
+        static constexpr int32 MaxDepth=64;          // 解析中の参照の深さ（material instanceの親とfunctionの呼び出し）
+        static constexpr int32 MaxObjects=4096;      // 解析済みのmaterial・function
+        static constexpr int32 MaxExpressions=262144;
+        TSet<const UObject*> Done;                   // 解析が終わった参照先。共有された参照（DAG）は1回だけ辿る。
+        TArray<const UObject*,TInlineAllocator<16>> Active; // 解析中の参照の列。ここにある参照に戻ったら循環。
+        int32 Expressions=0;bool bLayers=false;bool bInstance=false;FString Error;
+        bool Unknown(const TCHAR* Why,const UObject* O)
+        {
+            Error=FString::Printf(TEXT("The Landscape material cannot be inspected for Landscape Grass Output: %s (%s)."),Why,O?*O->GetPathName():TEXT("none"));
+            return false;
+        }
+        // 戻り値: false=拒否（Errorに理由）。bSkipは解析済みの参照。
+        bool Enter(const UObject* O,bool& bSkip)
+        {
+            bSkip=Done.Contains(O);if(bSkip)return true;
+            if(Active.Contains(O))return Unknown(TEXT("reference cycle"),O);
+            if(Active.Num()>=MaxDepth||Done.Num()>=MaxObjects)return Unknown(TEXT("analysis limit exceeded"),O);
+            Active.Add(O);return true;
+        }
+        bool Leave(const UObject* O,bool bOK){Active.Pop();if(bOK)Done.Add(O);return bOK;}
+        bool Material(const UMaterialInterface* M)
+        {
+            if(!M)return Unknown(TEXT("material is missing"),M);
+            bool bSkip=false;if(!Enter(M,bSkip))return false;if(bSkip)return true;
+            bool bOK=false;
+            if(const UMaterialInstance* I=Cast<UMaterialInstance>(M))
+            {bInstance=true;bOK=I->Parent?Material(I->Parent):Unknown(TEXT("material instance has no parent"),M);}
+            else if(const UMaterial* Base=Cast<UMaterial>(M))
+            {
+                const UMaterialInterface* Data=Base;   // CastCheckedを通らない基底のaccessorで、editor dataの有無を見る。
+                bOK=Cast<UMaterialEditorOnlyData>(Data->GetEditorOnlyData())?Graph(Base->GetExpressions(),M):Unknown(TEXT("material editor data is missing"),M);
+            }
+            else bOK=Unknown(TEXT("unsupported material class"),M);
+            return Leave(M,bOK);
+        }
+        bool Function(const UMaterialFunctionInterface* F)
+        {
+            bool bSkip=false;if(!Enter(F,bSkip))return false;if(bSkip)return true;
+            bool bOK=false;
+            if(const UMaterialFunctionInstance* I=Cast<UMaterialFunctionInstance>(F))
+            {bOK=I->Parent?Function(I->Parent):Unknown(TEXT("material function instance has no parent"),F);}
+            else if(const UMaterialFunction* Base=Cast<UMaterialFunction>(F))
+            {
+                // UMaterialFunction::GetEditorOnlyData()はnullを許さないCastCheckedなので、基底のaccessorを使う。
+                const UMaterialFunctionInterface* Data=Base;
+                bOK=Cast<UMaterialFunctionEditorOnlyData>(Data->GetEditorOnlyData())?Graph(Base->GetExpressions(),F):Unknown(TEXT("material function editor data is missing"),F);
+            }
+            else bOK=Unknown(TEXT("unsupported material function class"),F);
+            return Leave(F,bOK);
+        }
+        bool Graph(TConstArrayView<TObjectPtr<UMaterialExpression>> List,const UObject* Owner)
+        {
+            for(const UMaterialExpression* E:List)
+            {
+                if(!E)return Unknown(TEXT("expression is missing"),Owner);
+                if(++Expressions>MaxExpressions)return Unknown(TEXT("analysis limit exceeded"),Owner);
+                if(E->IsA<UMaterialExpressionLandscapeGrassOutput>()){Error=TEXT("Landscape Grass Output is present.");return false;}
+                // 関数を指定していない呼び出しは解決できない参照。
+                if(const auto* Call=Cast<UMaterialExpressionMaterialFunctionCall>(E))
+                {
+                    if(!Call->MaterialFunction)return Unknown(TEXT("material function call has no function"),E);
+                    if(!Function(Call->MaterialFunction))return false;   // 自分自身の呼び出しも、解析中の参照として循環になる
+                }
+                if(const auto* Layers=Cast<UMaterialExpressionMaterialAttributeLayers>(E))
+                {
+                    // 空のlayer・blendのslotはUEで正当（既定の背景layerなど）なので拒否しない。設定されたものは辿る。
+                    bLayers=true;
+                    for(const UMaterialFunctionInterface* X:Layers->GetLayers())if(X&&!Function(X))return false;
+                    for(const UMaterialFunctionInterface* X:Layers->GetBlends())if(X&&!Function(X))return false;
+                }
+                // expressionが持つmaterial functionへの参照を、種類を問わずすべて辿る（未知のexpressionも見逃さない）。
+                // 所有元のfunctionへのback-pointer（UMaterialExpression::Function）は呼び出しではないので、propertyで除く
+                // （値で除くと、自分自身を呼ぶfunctionを見逃す）。
+                static const FProperty* const BackPointer=FindFProperty<FProperty>(UMaterialExpression::StaticClass(),GET_MEMBER_NAME_CHECKED(UMaterialExpression,Function));
+                for(TPropertyValueIterator<FObjectPropertyBase> It(E->GetClass(),E);It;++It)
+                {
+                    if(It->Key==BackPointer)continue;
+                    const UMaterialFunctionInterface* F=Cast<UMaterialFunctionInterface>(It->Key->GetObjectPropertyValue(It->Value));
+                    if(F&&!Function(F))return false;
+                }
+            }
+            return true;
+        }
+    };
+    // 判定に使ったmaterialの一覧（書き込みの直前・直後に、同じ状態のままかを比べる）。
+    struct FGrassState
+    {
+        TArray<const UObject*> Materials;
+        bool operator==(const FGrassState& O)const{return Materials==O.Materials;}
+    };
+    // Grass instanceの状態（grass typeの上書き、生成済みのcomponent、生成中のtask、componentのgrass type）。
+    bool GrassInstancesAbsent(const ALandscape* A,FString& Error)
     {
         if(!A->GetGrassTypesOverrides().IsEmpty()||!A->FoliageComponents.IsEmpty()||!A->AsyncFoliageTasks.IsEmpty())
         {Error=TEXT("Landscape Grass state is present (grass type overrides or grass instance components).");return false;}
-        TArray<const UMaterialInterface*> Materials{A->GetLandscapeMaterial()};
-        for(const FLandscapePerLODMaterialOverride& O:A->GetPerLODOverrideMaterials())if(O.Material)Materials.Add(O.Material);
         for(const ULandscapeComponent* C:A->LandscapeComponents)
         {
             if(!C){Error=TEXT("Missing Landscape component.");return false;}
             if(!C->GetNamedGrassTypes().IsEmpty()){Error=TEXT("Landscape component has grass types.");return false;}
-            Materials.Add(C->GetLandscapeMaterial());
-            for(const FLandscapePerLODMaterialOverride& O:C->GetPerLODOverrideMaterials())if(O.Material)Materials.Add(O.Material);
         }
-        for(const UMaterialInterface* M:Materials)if(!MaterialGrassFree(M,Error))return false;
         return true;
+    }
+    bool GrassFree(const ALandscape* A,FString& Error,FGrassState* OutState=nullptr)
+    {
+        if(!GrassInstancesAbsent(A,Error))return false;
+        FGrassState State;FGrassGraphWalk Walk;
+        // bOptional: LODの上書きの空slotは正当（上書きなし）。Actor・componentのmaterialは必須（UEは未設定ならdefaultを返す）。
+        auto Visit=[&](const UMaterialInterface* M,bool bOptional){State.Materials.Add(M);return (bOptional&&!M)||Walk.Material(M);};
+        bool bOK=Visit(A->GetLandscapeMaterial(),false);
+        for(const FLandscapePerLODMaterialOverride& O:A->GetPerLODOverrideMaterials())bOK=bOK&&Visit(O.Material,true);
+        for(const ULandscapeComponent* C:A->LandscapeComponents)
+        {
+            bOK=bOK&&Visit(C->GetLandscapeMaterial(),false);
+            for(const FLandscapePerLODMaterialOverride& O:C->GetPerLODOverrideMaterials())bOK=bOK&&Visit(O.Material,true);
+        }
+        if(!bOK){Error=Walk.Error;return false;}
+        // Material Instanceはmaterial layerの関数を差し替えられる。差し替え後の関数は確かめないため、layerを使う構成は判定不能とする。
+        if(Walk.bLayers&&Walk.bInstance)
+        {Error=TEXT("The Landscape material cannot be inspected for Landscape Grass Output: material layers of a Material Instance are not inspected.");return false;}
+        if(OutState)*OutState=MoveTemp(State);
+        return true;
+    }
+    // 円形ブラシの書き込み後に復元を証明できなかった場合、このmodule sessionでは円形ブラシの書き込みを止める（v0.4のApplyと同じ方針）。
+    bool bBrushWritesDisabled=false;
+#if WITH_DEV_AUTOMATION_TESTS
+    bool bAutomationBrushRestoreFailure=false;
+#endif
+    bool BrushRestoreFault()
+    {
+#if WITH_DEV_AUTOMATION_TESTS
+        return GIsAutomationTesting&&bAutomationBrushRestoreFailure;
+#else
+        return false;
+#endif
     }
     // Read: Foliageが付いていても解決する（LandscapeもFoliageも変更しない用途）。
     // Write: 付属Foliageを拒否する（事後検証のない円形ブラシの書き込み）。
@@ -665,15 +782,32 @@ FLandscapeMCPResult Edit(const FEditRequest& R)
     Result.WorldMax = FVector(T.Origin.X+Rect.Max.X*T.Scale.X,T.Origin.Y+Rect.Max.Y*T.Scale.Y,MaxZ);
     Result.Message = TEXT("Validated complete edit; deltas include heightfield quantization; nothing saved.");
     if (R.bDryRun || Result.ChangedSampleCount == 0) { return Result; }
-    // Dry-runはv0.4の3 Toolと同じくGrassを検査しない。書き込む場合だけ拒否する。
-    if (!GrassFree(T.Actor,Error)) { return Fail(TEXT("UNSUPPORTED_GRASS_STATE: ")+Error,R.LandscapePath); }
-    if (GEditor->IsTransactionActive()) { return Fail(TEXT("Nested write transactions are unsupported."),R.LandscapePath); }
+    if (bBrushWritesDisabled)
+    { return Fail(TEXT("BRUSH_WRITES_DISABLED: A previous brush edit could not be proven restored; restart the Editor or reload the module after investigating."),R.LandscapePath); }
+    // Dry-runはv0.4の3 Toolと同じくGrassを検査しない。書き込む場合だけ拒否する。判定した状態を記録し、書き込みの直前・直後に比べる。
+    FGrassState GrassBefore;
+    if (!GrassFree(T.Actor,Error,&GrassBefore)) { return Fail(TEXT("UNSUPPORTED_GRASS_STATE: ")+Error,R.LandscapePath); }
+    if (GEditor->IsTransactionActive() || !GEditor->Trans) { return Fail(TEXT("Nested write transactions are unsupported."),R.LandscapePath); }
+    const FString OwnedContext = TEXT("LandscapeMCP.Brush.")+FGuid::NewGuid().ToString();
+    FGuid Owned;
     {
-        FScopedTransaction Transaction(INVTEXT("Landscape MCP Heightfield Edit"));
-        T.Actor->Modify(); T.Info->Modify();
+        FScopedTransaction Transaction(*OwnedContext,INVTEXT("Landscape MCP Heightfield Edit"),T.Actor);
+        if (GUndo) { Owned = GUndo->GetContext().TransactionId; }
+        // Modify()はOnObjectModifiedを同期で通知し、Editor拡張のlistenerがmaterialやGrassの状態を変え得る。
+        // ここでは汚れ印を付けず、書き込む直前に再検証してから付ける（拒否した場合にpackageを汚さない）。
+        T.Actor->Modify(false); T.Info->Modify(false);
         {
             FScopedSetLandscapeEditingLayer LayerScope(T.Actor,T.LayerGuid);
             FLandscapeEditDataInterface EditData(T.Info,T.LayerGuid);
+            FGrassState GrassNow; Error.Reset();
+            if (!Owned.IsValid() || !GrassFree(T.Actor,Error,&GrassNow) || !(GrassNow == GrassBefore))
+            {
+                // 自分ではまだ何も変えていない。Cancelは記録を捨てるだけで、listenerが行った変更は戻さない（このToolの変更ではない）。
+                Transaction.Cancel();
+                return Fail(TEXT("UNSUPPORTED_GRASS_STATE: Landscape Grass state changed while preparing the write; nothing was written. ")
+                    +(Owned.IsValid() ? (Error.IsEmpty() ? FString(TEXT("The Landscape material changed.")) : Error) : FString(TEXT("Could not start an owned transaction."))),R.LandscapePath);
+            }
+            T.Actor->MarkPackageDirty(); T.Info->MarkPackageDirty();
             EditData.SetHeightData(Rect.Min.X,Rect.Min.Y,Rect.Max.X,Rect.Max.Y,Output.GetData(),0,false,
                 nullptr,nullptr,nullptr,false,nullptr,nullptr,true,true,true);
             EditData.Flush();
@@ -681,15 +815,39 @@ FLandscapeMCPResult Edit(const FEditRequest& R)
         T.Actor->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_Heightmap_All);
         T.Actor->ForceUpdateLayersContent();
     }
+    // 書き込み中（SetHeightDataや更新処理の中のModify通知など）に状態が変わった場合も成功を返さない。
     FSourceReader Verify(T); TArray<uint16> Actual;
-    if (!Verify.Region(Rect,Actual,Error) || Actual != Output)
+    const bool bSourceOK = Verify.Region(Rect,Actual,Error) && Actual == Output;
+    FString GrassError; FGrassState GrassAfter;
+    const bool bGrassOK = GrassFree(T.Actor,GrassError,&GrassAfter) && GrassAfter == GrassBefore;
+    if (!bSourceOK || !bGrassOK)
     {
-        const bool bUndone = GEditor->UndoTransaction(false);
-        return Fail(FString(TEXT("Source verification failed; rollback ")) + (bUndone ? TEXT("completed.") : TEXT("FAILED; stop editing.")),R.LandscapePath);
+        // 所有するtransactionが最新である場合だけUndoする。Undoの後に、高さが元に戻り、Grass instanceが生成されていないことを確かめる。
+        // Grassの再生成はtransactionの外で起きるため、Undoが成功しただけでは復元できたとみなさない。
+        const FTransactionContext Latest = GEditor->Trans->GetUndoContext();
+        const bool bOwn = Owned.IsValid() && !GEditor->IsTransactionActive() && Latest.TransactionId == Owned
+            && Latest.Context == OwnedContext && Latest.PrimaryObject == T.Actor;
+        bool bRestored = false; FString RestoreError;
+        if (bOwn && GEditor->UndoTransaction(false))
+        {
+            T.Actor->ForceUpdateLayersContent();
+            FSourceReader Back(T); TArray<uint16> Now;
+            bRestored = Back.Region(ReadRect,Now,RestoreError) && Now == Original && GrassInstancesAbsent(T.Actor,RestoreError) && !BrushRestoreFault();
+        }
+        if (!bRestored) { bBrushWritesDisabled = true; }
+        const FString Rollback = bRestored ? FString(TEXT("rollback completed."))
+            : FString(TEXT("rollback FAILED; brush writes are disabled for this module session; stop editing."))
+              + (bOwn ? FString() : FString(TEXT(" Ownership of the latest transaction could not be proved; no Undo was attempted.")));
+        if (!bSourceOK) { return Fail(TEXT("Source verification failed; ")+Rollback,R.LandscapePath); }
+        return Fail(TEXT("UNSUPPORTED_GRASS_STATE: Landscape Grass state changed during the write; ")
+            +(GrassError.IsEmpty() ? FString(TEXT("The Landscape material changed.")) : GrassError)+TEXT(" ")+Rollback,R.LandscapePath);
     }
     Result.Message = TEXT("Source heightfield verified after edit; layer/collision update requested; Undo available; nothing saved.");
     return Result;
 }
+#if WITH_DEV_AUTOMATION_TESTS
+void SetAutomationBrushRestoreFailure(bool bFail){check(GIsAutomationTesting);bAutomationBrushRestoreFailure=bFail;}
+#endif
 
 namespace
 {
@@ -1096,7 +1254,7 @@ namespace
         while(RetryRecords.Num()>=MaxRetryRecords)RetryRecords.RemoveAt(0);
         RetryRecords.Add(MoveTemp(Record));
     }
-    bool GrassSafe(const FTarget& T,FString& Error)
+    bool GrassSafe(const FTarget& T,FString& Error,FGrassState* OutState=nullptr)
     {
         // Deliberately narrow allowlist. Material Instances, custom materials,
         // LOD overrides and grass caches are refused, including unknown graphs.
@@ -1107,7 +1265,7 @@ namespace
             if(C->GetLandscapeMaterial()!=Default||!C->GetPerLODOverrideMaterials().IsEmpty())
             {Error=TEXT("Component material override or grass state is unsupported.");return false;}
         // Grassの状態の判定は円形ブラシと共通。
-        return GrassFree(T.Actor,Error);
+        return GrassFree(T.Actor,Error,OutState);
     }
     bool CaptureTarget(const FString& Path,FTarget& T,FIdentity& I,FString& Code,FString& Error)
     {
@@ -1366,7 +1524,7 @@ bool MutationDisabled(){return bMutationDisabled;}
 bool VerifyAutomationCollision(const FString& Path,const FHeightfieldSnapshot& S,const FPreparedTerrainPlan& P,FString& Error)
 {check(GIsAutomationTesting);FTarget T;if(!Resolve(Path,T,Error,EResolveAccess::Read))return false;return CollisionMatches(T,S,P,Error);}
 void SetAutomationApplyFault(EApplyFault F){check(GIsAutomationTesting);AutomationFault=F;}
-void ResetAutomationApplyState(){check(GIsAutomationTesting);AutomationFault=EApplyFault::None;bMutationDisabled=false;RetryRecords.Reset();}
+void ResetAutomationApplyState(){check(GIsAutomationTesting);AutomationFault=EApplyFault::None;bMutationDisabled=false;bBrushWritesDisabled=false;bAutomationBrushRestoreFailure=false;RetryRecords.Reset();}
 int32 AutomationRetryRecordCount(){check(GIsAutomationTesting);return RetryRecords.Num();}
 #endif
 FString FormatFailureDiagnostic(const FLandscapeMCPTerrainOperationResult& Result,const FString& InStage)
@@ -1484,6 +1642,9 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
         O.Status=TEXT("NO_CHANGE");O.Message=TEXT("noChange: Target already satisfies the verified plan; no transaction or write.");
         Pending.Result=O;RememberRetry(MoveTemp(Pending));return O;
     }
+    // 書き込む直前の再検証のため、判定したmaterial・Grassの状態を記録する（Grass以外の対象の状態は事後検証で比べる）。
+    FGrassState GrassBefore;
+    if(!GrassSafe(Target,Error,&GrassBefore))return Failed(O,TEXT("UNSUPPORTED_GRASS_STATE"),TEXT("preWrite"),Error);
     FGuid Owned;FString OwnedContext=TEXT("LandscapeMCP.V04.")+FGuid::NewGuid().ToString();
     const FText Title=FText::FromString(TEXT("Landscape MCP v0.4 ")+O.Operation);
     double WriteMs=0,FlushMs=0;
@@ -1492,11 +1653,20 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
         if(!Transaction.IsOutstanding()||!GUndo)return Failed(O,TEXT("TRANSACTION_FAILED"),TEXT("transaction"),TEXT("Could not start an owned transaction."));
         Owned=GUndo->GetContext().TransactionId;
         if(!Owned.IsValid()){Transaction.Cancel();return Failed(O,TEXT("TRANSACTION_FAILED"),TEXT("transaction"),TEXT("Owned transaction has no valid GUID."));}
-        Target.Actor->Modify();Target.Info->Modify();
+        // Modify()の同期通知でlistenerがmaterialやGrassの状態を変え得る。汚れ印は再検証の後に付ける。
+        Target.Actor->Modify(false);Target.Info->Modify(false);
         const double WriteStart=FPlatformTime::Seconds();
         {
             FScopedSetLandscapeEditingLayer LayerScope(Target.Actor,Target.LayerGuid);
             FLandscapeEditDataInterface EditData(Target.Info,Target.LayerGuid);
+            FGrassState GrassNow;Error.Reset();
+            if(!GrassSafe(Target,Error,&GrassNow)||!(GrassNow==GrassBefore))
+            {
+                Transaction.Cancel();
+                return Failed(O,TEXT("UNSUPPORTED_GRASS_STATE"),TEXT("transaction"),TEXT("Landscape Grass state changed while preparing the write; nothing was written. ")
+                    +(Error.IsEmpty()?FString(TEXT("The Landscape material changed.")):Error));
+            }
+            Target.Actor->MarkPackageDirty();Target.Info->MarkPackageDirty();
             EditData.SetHeightData(Original.Rect.Min.X,Original.Rect.Min.Y,Original.Rect.Max.X,Original.Rect.Max.Y,Plan.Quantized.GetData(),0,false,
                 nullptr,nullptr,nullptr,false,nullptr,nullptr,true,true,true);
             EditData.Flush();
