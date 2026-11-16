@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 — 未リリース（RC3: 2026-11-15。公開日は公開時に記入）
+## v0.5.0 — 未リリース（RC4: 2026-11-17。公開日は公開時に記入）
 
 Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できるようにしました。Foliageを動かす・消す・置き直すApplyはありません。Foliageに影響する編集や、影響を判断できない編集は、書き込まずに拒否します。
 
@@ -23,6 +23,8 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - 円形ブラシの3 ToolのApplyで、Landscape Grassの状態がある、またはmaterialの中を確かめられない（Material Instanceのmaterial layer、editor dataのないmaterial）Landscapeを拒否する（`message`の先頭が`UNSUPPORTED_GRASS_STATE:`）。v0.3からv0.5.0 RC1までは検査せずに書き込んでいた。Dry-runは検査しない。Grassのない独自materialは従来どおり編集できる。Grassの判定はv0.4の3 ToolのApplyと共通
 - Grassの判定（RC3）: materialとmaterial functionのgraphを、Material Instance・Function Instanceの親、Function Call、material layerを含めて最後まで辿る。UEの列挙APIが飛ばす未解決の参照（親のないinstance、関数のないFunction Call）、参照の循環、editor dataの欠損、解析の上限の超過は判定不能として拒否する。RC2では、入れ子のMaterial Functionの中のGrass Outputを見逃し、未解決・循環する構成をGrassなしとして書き込んでいた（修正前のDLLで再現）
 - 書き込み直前・直後の再検証（RC3）: `Modify`の同期通知などでmaterial・Grassの状態が判定後に変わった場合、円形ブラシとv0.4の3 Toolは書き込まずに拒否する。円形ブラシで書き込み後に変わった場合は、所有するtransactionをUndoして拒否し、復元を確かめられなければ以後の円形ブラシの書き込みを止める（`BRUSH_WRITES_DISABLED:`）
+- rollbackの復元確認（RC4）: 最後の再検証から`SetHeightData`までの間に通知を出す処理を置かない（`MarkPackageDirty`を書き込みの後へ移した。円形ブラシとv0.4の3 Tool）。円形ブラシのUndoの後は、高さに加えて、material・graph（読み取りだけの有界な目印で、同じmaterialへのGrass Outputの追加や入れ子のfunctionの変更も比べる）・Grass、Undo履歴、packageのdirtyを書き込み前と照合し、すべて一致したときだけ`rollback completed`とする。RC3はUndoの後にgraphを照合せず、listenerがtransactionの外でGrass Outputを足した場合も`rollback completed`としてlatchを掛けなかった（修正前のDLLで再現）
+- 解析するmaterial・functionの数の上限（4,096）を、解析中と解析済みの合計で数える（RC3は解析済みだけを数え、4,097個以上を解析できた）
 - 対象の解決で、同じLandscapeの別proxyとHeightmapの共有を、非表示Levelまで含めて確認する（v0.4.0では表示中のLevelだけを見ていた）
 
 ### Changed
@@ -37,7 +39,7 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - Foliageによる拒否は既存の`FOLIAGE_SAFETY_CONFLICT`。`message`の先頭に理由（`FOLIAGE_IMPACT`、`FOLIAGE_UNKNOWN`、`FOLIAGE_SNAP_MODE`、`FOLIAGE_STALE`、`FOLIAGE_POST_VERIFY`）を付ける
 - Toolset Versionを`0.4`から`0.5`へ、Plugin descriptorの`Version`を5、`VersionName`を`0.5.0`へ変更。Tool数は13から15へ増加
 - Build Moduleの依存は変更なし
-- Automationは60 suiteから115件へ増加（`V05.Resolve.BrushMaterialGraph`の22構成を1件ずつ数える）
+- Automationは60 suiteから143件へ増加（`V05.Resolve.BrushMaterialGraph`の28構成と`V05.Resolve.BrushRollbackProof`の22構成を1件ずつ数える）
 
 ### Limitations
 

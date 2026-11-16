@@ -330,3 +330,35 @@ PR #2のレビューで、円形ブラシ3 ToolがLandscape Grassを検査せず
 - 親が循環するMaterial Instanceは、serializeが戻りません。テストのhashが原因でEditorが応答しなくなったため、テストはfieldを直接読む目印に変えました（製品の解析はserializeしません）。
 - 修正後の最初のテストで、自分自身を呼ぶMaterial Functionを見逃していました（所有元へのback-pointerを値で除いていたため）。propertyで除くように直し、テストで確認しました。
 
+
+### RC4（rollbackの復元保証とobject数の上限、2026-11-17）
+
+RC3の独立レビュー（MAJOR 1件、MINOR 1件）を受けて、最後の再検証から書き込みまでの間の通知をなくし、円形ブラシのUndoの後にmaterial・graph・Grass・Undo履歴・packageのdirtyを照合するようにしました（[v0.5 contract §13.4](v0.5-contract.md)）。反例は、修正前のRC3 DLL（製品sourceは`ecc817e`のまま、テストだけ追加）で1構成ずつ別processとtimeoutを使って再現し、同じテストを修正後のDLLで実行しました。各構成は3 Tool × clean・dirtyの開始状態で、高さ、material・graph、Grass、Undoの件数と最新の記録、packageのdirtyを比べます。
+
+| 項目 | 修正前（RC3のDLL） | 修正後（RC4） |
+|---|---|---|
+| `PackageMarkedDirtyEvent`・書き込み中の通知で、同じmaterialや入れ子のfunctionにGrass Outputを足す（4構成） | Undoの後もGrass Outputが残るのに`rollback completed`とし、latchを掛けなかった | `rollback FAILED`（`After Undo: Landscape Grass Output is present.`）。高さ・Undo履歴・dirtyは元に戻り、listenerの変更はこのToolが書き戻さずに残す。以後の円形ブラシ3 ToolのApplyはすべて`BRUSH_WRITES_DISABLED`で拒否（高さ・Undo・dirtyが不変、Dry-runは可） |
+| 書き込み中に入れ子のfunctionのgraphを変える（Grassなし） | 書き込んで成功を返した | `rollback FAILED`（graphの目印が一致しない）とlatch |
+| `PackageMarkedDirtyEvent`・書き込み中にActorのmaterialをGrassのあるものに差し替える | `rollback completed`（ActorはUndoで戻る） | 同じ。Undo後のmaterial・graph・dirty・Undo履歴の一致を確かめたうえで`rollback completed`。拒否した書き込みはRedoできない |
+| 最新のUndoの記録が自分のものでない（automationのhookで無関係なtransactionを入れる） | 対象外（RC3にhookがない） | Undoせずに`rollback FAILED`（所有を証明できない）とlatch |
+| 通常のApply → Undo → Redo | 成功 | 成功。Undoで高さ・dirty・Undo履歴が戻り、Redoで書き込みが戻る |
+| v0.4の`FlattenRectangle`で`PackageMarkedDirtyEvent`がmaterialを差し替える・default materialにGrass Outputを足す | rollbackが`VERIFIED`・`FAILED`（latch） | 同じ（v0.4は事後検証の`CaptureTarget`でGrassを検出する） |
+| 解析するobjectの数: 4,095・4,096・4,096（末尾に呼び出しの連鎖）・4,096（各functionを2回呼ぶ共有DAG） | 解析して成功 | 同じ |
+| 解析するobjectの数: 4,097・4,097（末尾に呼び出しの連鎖） | 上限を超えても解析して書き込んだ | `analysis limit exceeded`で拒否 |
+
+| 項目 | 結果 |
+|---|---|
+| Build（clean build） | 成功。警告はRC1〜RC3と同じ（C4701が4件） |
+| 反例の構成（1構成1 process、28件） | 修正後は28件すべてSuccess。timeout・crashなし |
+| 限定suite（`V05.Resolve.*`、`V04.Safety.GrassGuardAndOuterTransaction`、`V05.Foliage.UnknownForms`） | 58件すべてSuccess、警告0 |
+| Automation | 143件すべてSuccess、失敗0、未実行0。警告1件はEngineのネットワーク到達確認（`LogHttp`のtimeout）で、本Pluginとは無関係 |
+| MCP HTTPの往復 | v0.4・v0.5とも成功 |
+| Error / Ensure / Fatal | RC3と同じ19件（本文も一致）、Ensure 0、Fatal 0 |
+| 性能（3回） | 上限に近いApplyが約96〜116ms、矩形が約7〜8ms、64点の経路の計画が約65〜66ms、20,000 instanceのApplyが約19〜23ms（RC2・RC3と同じ範囲） |
+| `RunUAT BuildPlugin`（Win64） | `BUILD SUCCESSFUL`、終了コード0 |
+
+再現の途中で、次のことが分かりました（証跡に残しています）。
+
+- 最初の試行では、通常のApply → Undo → RedoのテストがRC3でも失敗しました。テストが`UndoTransaction(false)`（Redoなし）でUndoしていたためです。テストを`UndoTransaction(true)`に直し、反例をすべて実行し直しました。
+- `UndoTransaction(false)`は、Undoしたtransactionをbufferから外します。製品のrollbackもこのUndoを使うため、Undo履歴の照合は「自分のtransactionが残っていない」ことを確かめる形にしました。
+- v0.4の3 Toolで、書き込み後にGrassの状態が変わった場合の`errorCode`は`FOLIAGE_SAFETY_CONFLICT`（`FOLIAGE_POST_VERIFY`）になります（RC3から同じ。rollbackとlatchは正しく動作）。

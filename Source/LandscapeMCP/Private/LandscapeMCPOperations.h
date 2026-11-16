@@ -25,6 +25,9 @@ namespace LandscapeMCP
 #if WITH_DEV_AUTOMATION_TESTS
     // Automation専用: 円形ブラシのrollbackで、復元の確認を失敗扱いにする（latchの検証用）。ResetAutomationApplyStateで解除。
     void SetAutomationBrushRestoreFailure(bool bFail);
+    // Automation専用: 円形ブラシの書き込み後の検証が失敗したとき、rollbackの前に無関係なtransactionを1件入れる
+    // （最新のUndoの記録が自分のものでない場合にUndoしないことの検証用）。ResetAutomationApplyStateで解除。
+    void SetAutomationBrushUnrelatedTransaction(bool bInsert);
 #endif
     // 以下は読み取り専用。Transaction、Modify、Package dirty化を行わない。
     FLandscapeMCPSlopeResult Slope(const FString& Path, double X, double Y, double SampleDistanceCm);

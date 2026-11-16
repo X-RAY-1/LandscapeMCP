@@ -36,7 +36,7 @@ ProjectにBuild済みPluginと公式ToolsetRegistryを有効化し、隔離さ�
   '-TestExit=Automation Test Queue Empty' '-ReportExportPath=<REPORT_DIR>'
 ```
 
-`LandscapeMCP`を指定すると、115件すべて（`LandscapeMCP.V01.SafetyAndOperations`、`LandscapeMCP.V02.TerrainAnalysis`、`LandscapeMCP.V03.TerrainHardening`、`LandscapeMCP.V04.*`の57 suite、`LandscapeMCP.V05.*`の55件。`LandscapeMCP.V05.Resolve.BrushMaterialGraph`は22構成を`BrushMaterialGraph.<ID>`として1件ずつ実行できる）を実行します。機能追加時は既存suiteも必ず再実行してください。
+`LandscapeMCP`を指定すると、143件すべて（`LandscapeMCP.V01.SafetyAndOperations`、`LandscapeMCP.V02.TerrainAnalysis`、`LandscapeMCP.V03.TerrainHardening`、`LandscapeMCP.V04.*`の57 suite、`LandscapeMCP.V05.*`の83件。`LandscapeMCP.V05.Resolve.BrushMaterialGraph`の28構成は`BrushMaterialGraph.<ID>`、`LandscapeMCP.V05.Resolve.BrushRollbackProof`の22構成は`BrushRollbackProof.<ID>.<Clean|Dirty>`として1件ずつ実行できる）を実行します。機能追加時は既存suiteも必ず再実行してください。
 
 v0.4のsuiteには次の前提があります。
 

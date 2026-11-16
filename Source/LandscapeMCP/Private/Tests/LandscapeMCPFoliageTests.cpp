@@ -1596,6 +1596,22 @@ namespace LandscapeMCP::FoliageTests
     }
     constexpr const TCHAR* NotInspectable=TEXT("cannot be inspected");
     constexpr const TCHAR* GrassPresent=TEXT("Landscape Grass Output is present");
+    constexpr const TCHAR* LimitExceeded=TEXT("analysis limit exceeded");
+    // rootのmaterialからLeaves個のfunctionを呼び、最後に長さChainの呼び出しの連鎖を呼ぶ。bTwiceなら各functionを2回呼ぶ（共有DAG）。
+    // 解析するobjectの数は 1 + Leaves + Chain。
+    UMaterial* Budget(int32 Leaves,int32 Chain,bool bTwice)
+    {
+        UMaterial* M=NewMaterial();TArray<UMaterialFunction*> List;
+        for(int32 I=0;I<Leaves;++I){List.Add(NewFunction());CallFrom(M,List.Last());}
+        if(bTwice)for(UMaterialFunction* F:List)CallFrom(M,F);
+        if(Chain>0)
+        {
+            UMaterialFunction* Head=NewFunction();UMaterialFunction* Tail=Head;
+            for(int32 I=1;I<Chain;++I){UMaterialFunction* Next=NewFunction();CallFrom(Tail,Next);Tail=Next;}
+            CallFrom(M,Head);
+        }
+        return M;
+    }
 }
 namespace LandscapeMCP::FoliageTests
 {
@@ -1643,7 +1659,14 @@ namespace LandscapeMCP::FoliageTests
             {TEXT("A4_FunctionInstanceClean"),TEXT("function instance chain without grass"),+[](FAutomationTestBase&)->UMaterialInterface*
                 {return MaterialCalling(FunctionInstanceOf(FunctionInstanceOf(NewFunction())));},nullptr},
             {TEXT("A5_LayersEmptySlot"),TEXT("material layers with an empty slot"),+[](FAutomationTestBase&)->UMaterialInterface*{return LayeredMaterial(nullptr);},nullptr},
-            {TEXT("A6_LayersClean"),TEXT("material layers with a layer without grass"),+[](FAutomationTestBase&)->UMaterialInterface*{return LayeredMaterial(NewFunction());},nullptr}};
+            {TEXT("A6_LayersClean"),TEXT("material layers with a layer without grass"),+[](FAutomationTestBase&)->UMaterialInterface*{return LayeredMaterial(NewFunction());},nullptr},
+            // RC4: 解析するmaterial・functionの数の上限（4,096）。数は解析中と解析済みの合計（rootのmaterialを含む）。共有された参照は数えない。
+            {TEXT("B1_Objects4095"),TEXT("4,095 objects"),+[](FAutomationTestBase&)->UMaterialInterface*{return Budget(4094,0,false);},nullptr},
+            {TEXT("B2_Objects4096"),TEXT("4,096 objects"),+[](FAutomationTestBase&)->UMaterialInterface*{return Budget(4095,0,false);},nullptr},
+            {TEXT("B3_Objects4097"),TEXT("4,097 objects"),+[](FAutomationTestBase&)->UMaterialInterface*{return Budget(4096,0,false);},LimitExceeded},
+            {TEXT("B4_TailChain4097"),TEXT("4,097 objects ending in a call chain"),+[](FAutomationTestBase&)->UMaterialInterface*{return Budget(4094,2,false);},LimitExceeded},
+            {TEXT("B5_TailChain4096"),TEXT("4,096 objects ending in a call chain"),+[](FAutomationTestBase&)->UMaterialInterface*{return Budget(4093,2,false);},nullptr},
+            {TEXT("B6_SharedDag4096"),TEXT("4,096 objects, each function called twice"),+[](FAutomationTestBase&)->UMaterialInterface*{return Budget(4095,0,true);},nullptr}};
         return Cases;
     }
 }
@@ -1810,5 +1833,232 @@ bool FV05BrushGrassReentry::RunTest(const FString&)
         Actor->LandscapeMaterial=nullptr;
     }
     return true;
+}
+
+// RC4（M2の残り）: 書き込みの前後に同期で送られる通知（PackageMarkedDirtyEvent、書き込み中のModify）で
+// material・graphが変わった場合の、rollbackの判定とlatch。復元を確かめられたときだけ「rollback completed」とし、
+// listenerがtransactionの外で行った変更が残る場合は「rollback FAILED」で、円形ブラシ3 Toolの書き込みを止める。
+namespace LandscapeMCP::FoliageTests
+{
+    // UPackage::PackageMarkedDirtyEvent（MarkPackageDirtyのたびに同期で送られる）で、対象packageの最初の通知で1回だけ状態を変える。
+    struct FDirtyListener
+    {
+        FDelegateHandle Handle;int32 Fired=0;
+        FDirtyListener(UPackage* Target,TFunction<void()> Change)
+        {
+            Handle=UPackage::PackageMarkedDirtyEvent.AddLambda([this,Target,Change=MoveTemp(Change)](UPackage* P,bool)
+                {if(Fired==0&&P==Target){++Fired;Change();}});
+        }
+        ~FDirtyListener(){UPackage::PackageMarkedDirtyEvent.Remove(Handle);}
+    };
+    enum class ERollTrigger{None,DirtyEvent,DuringWrite};
+    enum class ERollChange{None,GrassMaterial,GrassInPlace,NestedGrassInPlace,NestedCleanEdit};
+    enum class ERollExpect{Applied,RolledBack,RollbackFailed,Unowned};
+    struct FRollbackCase{const TCHAR* Id;const TCHAR* Description;ERollTrigger Trigger;ERollChange Change;ERollExpect Expect;bool bUnrelated;};
+    const TArray<FRollbackCase>& RollbackCases()
+    {
+        static const TArray<FRollbackCase> Cases={
+            {TEXT("P1_DirtyEventSwap"),TEXT("PackageMarkedDirtyEvent sets a grass material"),ERollTrigger::DirtyEvent,ERollChange::GrassMaterial,ERollExpect::RolledBack,false},
+            {TEXT("P2_DirtyEventGrassInPlace"),TEXT("PackageMarkedDirtyEvent adds grass output to the same material"),ERollTrigger::DirtyEvent,ERollChange::GrassInPlace,ERollExpect::RollbackFailed,false},
+            {TEXT("P3_DirtyEventNestedGrass"),TEXT("PackageMarkedDirtyEvent adds grass output to a nested function"),ERollTrigger::DirtyEvent,ERollChange::NestedGrassInPlace,ERollExpect::RollbackFailed,false},
+            {TEXT("D1_DuringWriteGrassInPlace"),TEXT("during the write: grass output added to the same material"),ERollTrigger::DuringWrite,ERollChange::GrassInPlace,ERollExpect::RollbackFailed,false},
+            {TEXT("D2_DuringWriteNestedGrass"),TEXT("during the write: grass output added to a nested function"),ERollTrigger::DuringWrite,ERollChange::NestedGrassInPlace,ERollExpect::RollbackFailed,false},
+            {TEXT("D3_DuringWriteNestedCleanEdit"),TEXT("during the write: a nested function graph changes without grass"),ERollTrigger::DuringWrite,ERollChange::NestedCleanEdit,ERollExpect::RollbackFailed,false},
+            {TEXT("D4_DuringWriteSwap"),TEXT("during the write: grass material on the actor (restored by the owned Undo)"),ERollTrigger::DuringWrite,ERollChange::GrassMaterial,ERollExpect::RolledBack,false},
+            {TEXT("O1_UnownedLatest"),TEXT("during the write: grass material, latest transaction is not owned"),ERollTrigger::DuringWrite,ERollChange::GrassMaterial,ERollExpect::Unowned,true},
+            {TEXT("N1_ApplyUndoRedo"),TEXT("no change: apply, undo, redo"),ERollTrigger::None,ERollChange::None,ERollExpect::Applied,false}};
+        return Cases;
+    }
+    // 復元の照合に使う、テスト側の目印（Actorのmaterial、各graphのexpressionの数とGrass Outputの有無）。
+    struct FGraphPrint
+    {
+        const UObject* Material=nullptr;TArray<int32> Counts;TArray<bool> Grass;
+        bool operator==(const FGraphPrint& O)const{return Material==O.Material&&Counts==O.Counts&&Grass==O.Grass;}
+    };
+    template<class T> bool HasGrass(const T* O){for(const UMaterialExpression* E:O->GetExpressions())if(E&&E->IsA<UMaterialExpressionLandscapeGrassOutput>())return true;return false;}
+    FGraphPrint PrintOf(const ALandscape* A,const UMaterial* Root,const UMaterialFunction* Outer,const UMaterialFunction* Inner)
+    {
+        FGraphPrint P;P.Material=A->LandscapeMaterial;
+        P.Counts={Root->GetExpressions().Num(),Outer->GetExpressions().Num(),Inner->GetExpressions().Num()};
+        P.Grass={HasGrass(Root),HasGrass(Outer),HasGrass(Inner)};return P;
+    }
+    void RollbackCase(FAutomationTestBase& Test,const FRollbackCase& C,bool bDirtyStart)
+    {
+        for(const EOperation Op:{EOperation::Sculpt,EOperation::Smooth,EOperation::Flatten})
+        {
+            const FString Name=FString(OpName(Op))+TEXT(" / ")+C.Description+(bDirtyStart?TEXT(" / dirty start"):TEXT(" / clean start"));
+            FFixture F;if(!Test.TestTrue(Name+TEXT(": fixture"),F.Valid()))return;
+            FEditRequest Bump=Brush(F.Path,EOperation::Sculpt,false);Bump.RadiusCm=600;Bump.Strength=200;
+            if(!Test.TestTrue(Name+TEXT(": bump"),Edit(Bump).bSuccess))return;
+            // Grassのない入れ子のgraph（material → Outer → Inner）から始める。
+            UMaterialFunction* const Inner=NewFunction();UMaterialFunction* const Outer=NewFunction();CallFrom(Outer,Inner);
+            UMaterial* const Plain=MaterialCalling(Outer);
+            ALandscape* const Actor=F.Actor;ULandscapeInfo* const Info=Actor->GetLandscapeInfo();Actor->LandscapeMaterial=Plain;
+            UPackage* const Package=Actor->GetPackage();Package->SetDirtyFlag(bDirtyStart);
+            const auto Original=F.Read();const int32 Undo=UToolsetLibrary::GetActiveUndoCount();
+            const FGuid UndoBefore=GEditor->Trans->GetUndoContext(false).TransactionId;
+            const FGraphPrint Before=PrintOf(Actor,Plain,Outer,Inner);
+            auto Change=[&]()
+            {
+                switch(C.Change)
+                {
+                case ERollChange::None:break;
+                case ERollChange::GrassMaterial:Actor->LandscapeMaterial=GrassMaterial();break;
+                case ERollChange::GrassInPlace:AddTo<UMaterialExpressionLandscapeGrassOutput>(Plain);break;   // Modifyもtransactionへの記録もしない変更
+                case ERollChange::NestedGrassInPlace:AddTo<UMaterialExpressionLandscapeGrassOutput>(Inner);break;
+                case ERollChange::NestedCleanEdit:CallFrom(Inner,NewFunction());break;
+                }
+            };
+            TUniquePtr<FDirtyListener> Dirty;TUniquePtr<FModifyListener> Modified;bool bArmed=false;
+            if(C.Trigger==ERollTrigger::DirtyEvent)Dirty=MakeUnique<FDirtyListener>(Package,Change);
+            if(C.Trigger==ERollTrigger::DuringWrite)
+                Modified=MakeUnique<FModifyListener>([&](UObject* O){if(O==Actor||O==Info){bArmed|=O==Info;return false;}return bArmed&&O->IsIn(Actor);},Change);
+            FCoreUObjectDelegates::ObjectsModifiedThisFrame.Empty();   // 次のframeと同じ通知の状態（BrushGrassReentryを参照）
+            SetAutomationBrushUnrelatedTransaction(C.bUnrelated);
+            const auto Apply=Edit(Brush(F.Path,Op,false));
+            SetAutomationBrushUnrelatedTransaction(false);
+            const int32 Fired=Dirty?Dirty->Fired:Modified?Modified->Fired:0;Dirty.Reset();Modified.Reset();
+            Test.AddInfo(Name+TEXT(": ")+Apply.Message);
+            Test.TestEqual(Name+TEXT(": listener fired"),Fired,C.Trigger==ERollTrigger::None?0:1);
+            const FGraphPrint After=PrintOf(Actor,Plain,Outer,Inner);
+            switch(C.Expect)
+            {
+            case ERollExpect::Applied:
+            {
+                Test.TestTrue(Name+TEXT(": apply ")+Apply.Message,Apply.bSuccess);
+                const auto Written=F.Read();Test.TestTrue(Name+TEXT(": written"),Written.Heights!=Original.Heights);
+                Test.TestEqual(Name+TEXT(": one transaction"),UToolsetLibrary::GetActiveUndoCount(),Undo+1);
+                Test.TestTrue(Name+TEXT(": package dirtied by the write"),Package->IsDirty());
+                Test.TestTrue(Name+TEXT(": undo"),GEditor->UndoTransaction(true));Actor->ForceUpdateLayersContent();   // Redoできる通常のUndo
+                Test.TestTrue(Name+TEXT(": undo restores heights"),F.Read().Heights==Original.Heights);
+                Test.TestEqual(Name+TEXT(": undo restores dirty state"),Package->IsDirty(),bDirtyStart);
+                Test.TestEqual(Name+TEXT(": undo restores undo history"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+                Test.TestTrue(Name+TEXT(": undo restores latest undo record"),GEditor->Trans->GetUndoContext(false).TransactionId==UndoBefore);
+                Test.TestTrue(Name+TEXT(": redo"),GEditor->RedoTransaction());Actor->ForceUpdateLayersContent();
+                Test.TestTrue(Name+TEXT(": redo restores the edit"),F.Read().Heights==Written.Heights);
+                Test.TestEqual(Name+TEXT(": redo restores the transaction"),UToolsetLibrary::GetActiveUndoCount(),Undo+1);
+                Test.TestTrue(Name+TEXT(": redo dirties the package"),Package->IsDirty());
+                Test.TestTrue(Name+TEXT(": material graph unchanged"),After==Before);
+                GEditor->UndoTransaction(false);
+                break;
+            }
+            case ERollExpect::RolledBack:
+                Test.TestFalse(Name+TEXT(": apply refused"),Apply.bSuccess);
+                Test.TestTrue(Name+TEXT(": reason ")+Apply.Message,Apply.Message.StartsWith(TEXT("UNSUPPORTED_GRASS_STATE"))&&Apply.Message.Contains(TEXT("rollback completed")));
+                Test.TestTrue(Name+TEXT(": heights restored"),F.Read().Heights==Original.Heights);
+                Test.TestEqual(Name+TEXT(": undo history restored"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+                Test.TestTrue(Name+TEXT(": latest undo record restored"),GEditor->Trans->GetUndoContext(false).TransactionId==UndoBefore);
+                Test.TestFalse(Name+TEXT(": refused write cannot be redone"),GEditor->Trans->CanRedo());
+                Test.TestEqual(Name+TEXT(": dirty state restored"),Package->IsDirty(),bDirtyStart);
+                Test.TestTrue(Name+TEXT(": material and graph restored by the owned Undo"),After==Before);
+                Test.TestTrue(Name+TEXT(": no grass components"),Actor->FoliageComponents.IsEmpty());
+                {
+                    const auto Next=Edit(Brush(F.Path,Op,false));
+                    Test.TestTrue(Name+TEXT(": later brush write allowed ")+Next.Message,Next.bSuccess);
+                    if(Next.bSuccess)GEditor->UndoTransaction(false);
+                }
+                break;
+            case ERollExpect::RollbackFailed:
+            case ERollExpect::Unowned:
+            {
+                Test.TestFalse(Name+TEXT(": apply refused"),Apply.bSuccess);
+                Test.TestTrue(Name+TEXT(": reason ")+Apply.Message,Apply.Message.StartsWith(TEXT("UNSUPPORTED_GRASS_STATE"))&&Apply.Message.Contains(TEXT("rollback FAILED")));
+                if(C.Expect==ERollExpect::Unowned)
+                {
+                    // 最新の記録は自分のものではないので、Undoしない（高さは書き込まれたまま。Undoの記録は自分のものと無関係の1件）。
+                    Test.TestTrue(Name+TEXT(": ownership not proved"),Apply.Message.Contains(TEXT("Ownership of the latest transaction could not be proved")));
+                    Test.TestTrue(Name+TEXT(": no undo attempted"),F.Read().Heights!=Original.Heights);
+                    Test.TestEqual(Name+TEXT(": own and unrelated transactions remain"),UToolsetLibrary::GetActiveUndoCount(),Undo+2);
+                    Test.TestTrue(Name+TEXT(": latest record is the unrelated one"),GEditor->Trans->GetUndoContext(false).Context.StartsWith(TEXT("LandscapeMCP.Automation.")));
+                }
+                else
+                {
+                    // 自分のtransactionはUndoした。listenerがtransactionの外で加えたgraphの変更は、このToolでは戻さずに残す。
+                    Test.TestTrue(Name+TEXT(": heights restored"),F.Read().Heights==Original.Heights);
+                    Test.TestEqual(Name+TEXT(": undo history restored"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+                    Test.TestTrue(Name+TEXT(": latest undo record restored"),GEditor->Trans->GetUndoContext(false).TransactionId==UndoBefore);
+                    Test.TestFalse(Name+TEXT(": refused write cannot be redone"),GEditor->Trans->CanRedo());
+                    Test.TestEqual(Name+TEXT(": dirty state restored"),Package->IsDirty(),bDirtyStart);
+                    Test.TestTrue(Name+TEXT(": actor material restored"),Actor->LandscapeMaterial==Plain);
+                    Test.TestFalse(Name+TEXT(": the listener's graph change is left as is"),After==Before);
+                }
+                // latch: 次の円形ブラシの書き込みは、3 Toolとも書き込まずに拒否する。
+                const auto Latched=F.Read();const int32 LatchedUndo=UToolsetLibrary::GetActiveUndoCount();const bool bLatchedDirty=Package->IsDirty();
+                for(const EOperation Next:{EOperation::Sculpt,EOperation::Smooth,EOperation::Flatten})
+                {
+                    const FString NextName=Name+TEXT(" / then ")+OpName(Next);
+                    const auto R=Edit(Brush(F.Path,Next,false));
+                    Test.TestFalse(NextName+TEXT(": refused"),R.bSuccess);
+                    Test.TestTrue(NextName+TEXT(": latch reason ")+R.Message,R.Message.StartsWith(TEXT("BRUSH_WRITES_DISABLED")));
+                    Test.TestTrue(NextName+TEXT(": heights unchanged"),F.Read().Heights==Latched.Heights);
+                    Test.TestEqual(NextName+TEXT(": undo unchanged"),UToolsetLibrary::GetActiveUndoCount(),LatchedUndo);
+                    Test.TestEqual(NextName+TEXT(": dirty unchanged"),Package->IsDirty(),bLatchedDirty);
+                    const auto Dry=Edit(Brush(F.Path,Next,true));
+                    Test.TestTrue(NextName+TEXT(": dry run still allowed"),Dry.bSuccess);
+                }
+                ResetAutomationApplyState();
+                break;
+            }
+            }
+            Actor->LandscapeMaterial=nullptr;Actor->FoliageComponents.Reset();
+        }
+    }
+    // v0.4の3 Tool（FlattenRectangleで代表）: PackageMarkedDirtyEventでの変化は書き込み後の検証で検出し、
+    // 所有するtransactionをUndoして、Undo後の状態（Grassを含む）を確かめる（v0.4の既存の契約）。
+    void V04DirtyEventCase(FAutomationTestBase& Test,bool bInPlace,bool bDirtyStart)
+    {
+        const FString Name=FString(bInPlace?TEXT("FlattenRectangle / PackageMarkedDirtyEvent adds grass output to the default material")
+            :TEXT("FlattenRectangle / PackageMarkedDirtyEvent sets a grass material"))+(bDirtyStart?TEXT(" / dirty start"):TEXT(" / clean start"));
+        FFixture F;if(!Test.TestTrue(Name+TEXT(": fixture"),F.Valid()))return;
+        ALandscape* const Actor=F.Actor;UPackage* const Package=Actor->GetPackage();Package->SetDirtyFlag(bDirtyStart);
+        UMaterial* const Default=UMaterial::GetDefaultMaterial(MD_Surface);
+        const auto Original=F.Read();const int32 Undo=UToolsetLibrary::GetActiveUndoCount();
+        UMaterialExpressionLandscapeGrassOutput* Added=nullptr;
+        TUniquePtr<FDirtyListener> Listener=MakeUnique<FDirtyListener>(Package,[&]
+        {
+            if(!bInPlace){Actor->LandscapeMaterial=GrassMaterial();return;}
+            Added=NewObject<UMaterialExpressionLandscapeGrassOutput>(Default);Added->Material=Default;Default->GetExpressionCollection().AddExpression(Added);
+        });
+        FString Stage;const auto O=Execute(F.Rect(100,false),&Stage);
+        Test.TestEqual(Name+TEXT(": listener fired"),Listener->Fired,1);Listener.Reset();
+        Test.AddInfo(Name+TEXT(": ")+O.ErrorCode+TEXT(" / ")+Stage+TEXT(" / ")+O.Message);
+        Test.TestFalse(Name+TEXT(": not applied"),O.bSuccess);
+        Test.TestTrue(Name+TEXT(": heights restored"),F.Read().Heights==Original.Heights);
+        Test.TestEqual(Name+TEXT(": undo history restored"),UToolsetLibrary::GetActiveUndoCount(),Undo);
+        Test.TestEqual(Name+TEXT(": dirty state restored"),Package->IsDirty(),bDirtyStart);
+        Test.TestTrue(Name+TEXT(": actor material restored"),Actor->LandscapeMaterial==nullptr||Actor->GetLandscapeMaterial()==Default);
+        if(bInPlace)
+        {
+            Test.TestEqual(Name+TEXT(": restoration not provable"),O.RollbackStatus,FString(TEXT("FAILED")));
+            Test.TestTrue(Name+TEXT(": v0.4 mutation disabled"),MutationDisabled());
+        }
+        else
+        {
+            Test.TestEqual(Name+TEXT(": restoration verified"),O.RollbackStatus,FString(TEXT("VERIFIED")));
+            Test.TestFalse(Name+TEXT(": v0.4 mutation still enabled"),MutationDisabled());
+        }
+        if(Added)Default->GetExpressionCollection().RemoveExpression(Added);
+        Test.TestFalse(Name+TEXT(": default material cleaned up"),HasGrass(Default));
+        ResetAutomationApplyState();Actor->LandscapeMaterial=nullptr;
+    }
+}
+IMPLEMENT_COMPLEX_AUTOMATION_TEST(FV05BrushRollbackProof,"LandscapeMCP.V05.Resolve.BrushRollbackProof",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+void FV05BrushRollbackProof::GetTests(TArray<FString>& OutBeautifiedNames,TArray<FString>& OutTestCommands)const
+{
+    for(const TCHAR* Start:{TEXT("Clean"),TEXT("Dirty")})
+    {
+        for(const FRollbackCase& C:RollbackCases()){const FString Id=FString(C.Id)+TEXT(".")+Start;OutBeautifiedNames.Add(Id);OutTestCommands.Add(Id);}
+        for(const TCHAR* V:{TEXT("V1_V04DirtyEventSwap"),TEXT("V2_V04DirtyEventDefaultGrassInPlace")}){const FString Id=FString(V)+TEXT(".")+Start;OutBeautifiedNames.Add(Id);OutTestCommands.Add(Id);}
+    }
+}
+bool FV05BrushRollbackProof::RunTest(const FString& Parameters)
+{
+    FString Id,Start;
+    if(!Parameters.Split(TEXT("."),&Id,&Start)||(Start!=TEXT("Clean")&&Start!=TEXT("Dirty"))){AddError(TEXT("Unknown case: ")+Parameters);return false;}
+    const bool bDirty=Start==TEXT("Dirty");
+    if(Id==TEXT("V1_V04DirtyEventSwap")){V04DirtyEventCase(*this,false,bDirty);return true;}
+    if(Id==TEXT("V2_V04DirtyEventDefaultGrassInPlace")){V04DirtyEventCase(*this,true,bDirty);return true;}
+    for(const FRollbackCase& C:RollbackCases())if(Id==C.Id){RollbackCase(*this,C,bDirty);return true;}
+    AddError(TEXT("Unknown case: ")+Parameters);return false;
 }
 #endif

@@ -379,8 +379,8 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - v0.4の3 ToolのApplyは、Grassの状態があるLandscapeを`UNSUPPORTED_GRASS_STATE`で拒否します。Dry-runの`foliage`ではGrassを判定できないもの（`LANDSCAPE_GRASS`）として扱い、`UNKNOWN`になります。
 - 円形ブラシの3 Tool（`SculptRegion`、`SmoothRegion`、`FlattenRegion`）のApplyも、Grassの状態があるLandscapeを拒否します。`message`の先頭は`UNSUPPORTED_GRASS_STATE:`です。Dry-runはGrassを検査せず、v0.4の3 Toolと同じく成功します。書き込みが不要な場合（変化0）は、従来どおり何も書き込まずに成功します。
 - Grassの状態として扱うもの: material（Material Instanceの親、Material Function・Function Instance・material layerの関数を、入れ子や共有も含めて最後まで辿る）のLandscape Grass Output、ActorのGrass Type override、Componentのgrass type、生成済みのGrassのcomponentと非同期task。
-- materialの中を最後まで確かめられない構成も、Grassがないと証明できないため拒否します: 親のないMaterial Instance・Material Function Instance、関数を指定していないFunction Call、参照の循環（Material Instanceの親、関数の呼び出し）、editor dataのないmaterial・material function、解析の上限（参照の深さ64、material・function 4096、expression 262,144）の超過、material layerを使うmaterialのMaterial Instance（layerの差し替え先を確かめないため）。空のlayer slotや、LODの上書きの空slotは拒否しません。解析は読み取りだけで、materialを変更・修復しません。
-- 判定の後も、書き込む直前と書き込んだ直後に、Grassの状態とmaterialが判定時と同じことを確かめます。Editor拡張などが`Modify`の通知の中でmaterialやGrassの状態を変えた場合、書き込む前なら何も書き込まずに拒否し、書き込んだ後なら本Pluginのtransactionを1件だけUndoして拒否します（`message`はどちらも`UNSUPPORTED_GRASS_STATE:`で始まります）。Undoの後に高さが元に戻り、Grassのinstanceが生成されていないことを確かめられない場合は、成功を返さず、そのmodule sessionの間は円形ブラシの書き込みを止めます（`BRUSH_WRITES_DISABLED:`）。
+- materialの中を最後まで確かめられない構成も、Grassがないと証明できないため拒否します: 親のないMaterial Instance・Material Function Instance、関数を指定していないFunction Call、参照の循環（Material Instanceの親、関数の呼び出し）、editor dataのないmaterial・material function、解析の上限（参照の深さ64、解析するmaterial・function 4,096、expression 262,144）の超過、material layerを使うmaterialのMaterial Instance（layerの差し替え先を確かめないため）。空のlayer slotや、LODの上書きの空slotは拒否しません。解析は読み取りだけで、materialを変更・修復しません。
+- 判定の後も、書き込む直前と書き込んだ直後に、Grassの状態、material、materialのgraph（同じmaterialへのexpressionの追加など、その場での変更を含む）が判定時と同じことを確かめます。Editor拡張などが`Modify`や`MarkPackageDirty`の通知の中でこれらを変えた場合、書き込む前なら何も書き込まずに拒否し、書き込んだ後なら本Pluginのtransactionを1件だけUndoして拒否します（`message`はどちらも`UNSUPPORTED_GRASS_STATE:`で始まります）。Undoの後に、高さ、material・graph・Grass、Undo履歴、packageのdirtyがすべて書き込み前と同じことを確かめられた場合だけ`rollback completed`とします。確かめられない場合（listenerがtransactionの外でmaterialを変えた場合など。本Pluginはその変更を書き戻しません）は`rollback FAILED`とし、そのmodule sessionの間は円形ブラシ3 Toolの書き込みを止めます（`BRUSH_WRITES_DISABLED:`）。
 - Grassを使わない独自materialのLandscapeは、円形ブラシで従来どおり編集できます（v0.4の3 ToolのApplyは、従来どおりEngineのdefault materialだけ）。GrassはUEが地形の変更後に再生成するため、本PluginはGrassのinstanceを保護も検証もしません。
 - 将来の検討事項（未実装・時期未定）: Grassを使うLandscapeへの安全な編集を、将来のバージョンで検討しています。実装するバージョンや時期は決まっていません。
 
@@ -427,7 +427,7 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - [開発手順](docs/development.md): 構成、Build、Automationの実行方法
 - [検証要約](docs/testing.md): これまでに行った検証の範囲と結果
 
-Automation Testは115件あります（`LandscapeMCP.V05.Resolve.BrushMaterialGraph`は22構成を1件ずつ数えます）。
+Automation Testは143件あります（`LandscapeMCP.V05.Resolve.BrushMaterialGraph`の28構成と`LandscapeMCP.V05.Resolve.BrushRollbackProof`の22構成を1件ずつ数えます）。
 
 | suite | 対象 |
 |---|---|
@@ -435,7 +435,7 @@ Automation Testは115件あります（`LandscapeMCP.V05.Resolve.BrushMaterialGr
 | `LandscapeMCP.V02.TerrainAnalysis` | 傾斜・領域の高さ・歩行可能性・量子化誤差の上限・read-only |
 | `LandscapeMCP.V03.TerrainHardening` | 実三角形・近傍解析・領域の歩行可能性・Collisionの三角形分割の確認 |
 | `LandscapeMCP.V04.*`（57 suite） | v0.4の3 Tool: 計画、公式schema、Dry-runの不変性、Apply、Undo／Redo、retry、fault注入によるrollbackとlatch、collisionの量子化、prop、保存と副作用がないこと、MCPの往復 |
-| `LandscapeMCP.V05.*`（55件） | Foliage Safety: 影響の分類と実三角形の高さ、collisionとの照合、Foliageなし・範囲外・範囲内、Undo／Redoと複数frame後、非表示・ロック中・別Level・未ロードのLevel、Actor Foliage・Procedural・Grass、snap mode、走査上限、書き込み直前の再確認、事後検証とrollback、円形ブラシの付属判定とGrass判定（materialのgraphの解析、書き込み直前・直後の再検証）、読み取りToolの不変性、v0.4.0のschemaとの互換、HTTPとPythonからの呼び出し |
+| `LandscapeMCP.V05.*`（83件） | Foliage Safety: 影響の分類と実三角形の高さ、collisionとの照合、Foliageなし・範囲外・範囲内、Undo／Redoと複数frame後、非表示・ロック中・別Level・未ロードのLevel、Actor Foliage・Procedural・Grass、snap mode、走査上限、書き込み直前の再確認、事後検証とrollback、円形ブラシの付属判定とGrass判定（materialのgraphの解析、書き込み直前・直後の再検証）、読み取りToolの不変性、v0.4.0のschemaとの互換、HTTPとPythonからの呼び出し |
 
 Automationは新しい未保存Mapを作り、Undo履歴も使います。作業中のEditorではなく、検証用の別Projectで実行してください。実行方法と前提は[開発手順](docs/development.md)にあります。
 
