@@ -10,7 +10,8 @@ AI Agentの操作を前提として、対象や入力が不明な場合はfail-c
 - 非World Partition、external actor非使用、可視・ロック解除済みLevel。
 - native `ALandscape`のみ。同一Landscape GUIDの追加Proxyも拒否。
 - 標準`ULandscapeEditLayer`が1つ、可視、ロック解除、height alpha 1、Blueprint brushなし。
-- 無回転、正Scale、Naniteなし、付属Foliageなし、Visibility Holeなし。
+- 無回転、正Scale、Naniteなし、Visibility Holeなし。
+- Foliage（v0.5）: 読み取りとDry-runはFoliage付きでも可。v0.4の3 ToolのApplyはFoliage gateを通った場合だけ、円形ブラシは付属Foliageなしの場合だけ書き込む。円形ブラシのApplyも、Landscape Grassがある、またはmaterialの中を確かめられない場合は書き込まない（v0.4の3 ToolのApplyと共通の判定）。Levelは非表示・ロック中も含めて全て検査し、読み込まれていないstreaming levelがあれば書き込まない。
 - 元HeightmapはLevel Package内部のBGRA8、各軸1024以下。他LandscapeとのTexture共有も拒否。
 
 ## 入力と範囲
@@ -48,7 +49,7 @@ UndoはEditor既存コマンドを使用します。書き込みのnested transa
 
 保存／Autosave APIを呼ばず、Autosave設定も変更しません。書き込みによるPackage dirty化はUndoに必要です。Editor独立AutosaveはTool外なので、保存禁止の試験では別途無効にした隔離Editorを使用してください。
 
-付属FoliageやTexture共有など、別Actorへ影響し得る構成を拒否します。Collision更新は実行しますが、結果の歩行可能性を保証するToolではありません。SlopeやCharacter設定の確認が必要です。
+Foliageへの影響がある・判断できない編集、Texture共有など、別Actorへ影響し得る構成を拒否します。Foliageは書き換えません（v0.5）。Collision更新は実行しますが、結果の歩行可能性を保証するToolではありません。SlopeやCharacter設定の確認が必要です。
 
 ## v0.4の3 Tool（FlattenRectangle / FlattenPath / CreateWalkablePath）
 

@@ -22,10 +22,20 @@ namespace LandscapeMCP
         int32 CountX, int32 CountY, int32 Sections, int32 Quads, double InitialHeight, bool bDryRun);
     FLandscapeMCPResult Height(const FString& Path, double X, double Y);
     FLandscapeMCPResult Edit(const FEditRequest& Request);
+#if WITH_DEV_AUTOMATION_TESTS
+    // Automation専用: 円形ブラシのrollbackで、復元の確認を失敗扱いにする（latchの検証用）。ResetAutomationApplyStateで解除。
+    void SetAutomationBrushRestoreFailure(bool bFail);
+    // Automation専用: 円形ブラシの書き込み後の検証が失敗したとき、rollbackの前に無関係なtransactionを1件入れる
+    // （最新のUndoの記録が自分のものでない場合にUndoしないことの検証用）。ResetAutomationApplyStateで解除。
+    void SetAutomationBrushUnrelatedTransaction(bool bInsert);
+#endif
     // 以下は読み取り専用。Transaction、Modify、Package dirty化を行わない。
     FLandscapeMCPSlopeResult Slope(const FString& Path, double X, double Y, double SampleDistanceCm);
     FLandscapeMCPHeightRegionResult HeightRegion(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, double SpacingCm);
     FLandscapeMCPWalkabilityResult Walkability(const FString& Path, double X, double Y, double WalkableFloorAngleDeg, double SampleDistanceCm);
     FLandscapeMCPSlopeNeighborhoodResult SlopeNeighborhood(const FString& Path, double X, double Y, double RadiusCm, double SampleDistanceCm);
     FLandscapeMCPWalkabilityRegionResult WalkabilityRegion(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, double WalkableFloorAngleDeg);
+    // 以下も読み取り専用。Foliage付きのLandscapeでも、LandscapeとFoliageを変更しない。
+    FLandscapeMCPFoliageInspectResult FoliageInspect(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, int32 MaxInstances);
+    FLandscapeMCPCapabilitiesResult Capabilities();
 }

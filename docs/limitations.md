@@ -6,7 +6,9 @@ v0.4.0時点の制限です。v0.4で追加した3 Tool（FlattenRectangle / Fla
 
 World Partition、external actor Level、Streaming Proxy、Landscape subclass、同一GUIDの追加Proxy、非表示／ロックLevel、回転Landscape、負Scale、異常Scale、Naniteは拒否します。
 
-Edit Layerは標準Layerが1つだけ必要です。複数Layer、非表示／ロックLayer、height alphaが1以外、Blueprint／procedural brushは非対応です。付属Foliage、Visibility Hole、欠損Component、外部／共有／巨大Heightmapも拒否します。通常読み取りでも同じ条件を検証します。
+Edit Layerは標準Layerが1つだけ必要です。複数Layer、非表示／ロックLayer、height alphaが1以外、Blueprint／procedural brushは非対応です。Visibility Hole、欠損Component、外部／共有／巨大Heightmapも拒否します。通常読み取りでも同じ条件を検証します。
+
+付属Foliage（v0.5）: 読み取りToolとv0.4の3 ToolのDry-runは、Foliageが付いたLandscapeでも使えます。v0.4の3 ToolのApplyは、Foliageへの影響がない場合（`foliage.verdict`が`NO_FOLIAGE`か`SAFE_TO_APPLY`）だけ書き込みます。円形ブラシの3 Toolは、付属Foliageがあれば従来どおり拒否します。
 
 PIE／Save／GC中の操作、nested write transaction、入力・作成・編集Sample上限超過、Heightfield overflowはFAILです。
 
@@ -18,6 +20,8 @@ PIE／Save／GC中の操作、nested write transaction、入力・作成・編�
 - Heightmap適用Tool
 - 独立RebuildCollision Tool
 - World Partition／Proxy対応
+- Landscape Grass（Grass Output・Grass Type）を使うLandscapeへの編集（下の「Landscape Grass」を参照）
+- Water System・Splineの検出・保護・自動追従と、保護領域の設定（下の「Water System・Spline・保護領域」を参照）
 - `NEAR_LIMIT`／`slopeUncertaintyDegrees`の名称見直し（schema互換性のため保留）
 
 ## 地形評価Toolの制限
@@ -59,6 +63,37 @@ GetHeightは元Heightfieldのbilinear値であり、Collision高さそのもの�
 - 周辺への副作用の確認は、Actor一覧、各Actor自身のproperty、対象Landscapeのweightmapなどの比較です。他Actorのcomponent内部の状態まで毎回比較しているわけではありません。
 - rollback後に元へ戻ったことを証明できなかった場合、3 ToolのApplyはEditorを再起動するまで使えません。MCPから解除する方法はありません。
 - collisionの量子化の計算はUE5.8のChaos heightfieldの実装に合わせています。別のEngineバージョンではApplyが拒否される可能性があります。
+
+## v0.5のFoliage Safetyの制限
+
+- Foliageを動かす・消す・置き直す編集はありません。影響がある編集は拒否するだけです。
+- 判定できないものとして拒否する形式・状態: Landscape Grass、Procedural Foliage、Actor Foliage、対象と別のLevel（非表示・ロック中を含む）のFoliage、読み込まれていないstreaming level、走査上限（読み取り範囲に重なる65,536 instance）の超過、付属先を証明できないinstance。
+- `FoliageLandscapeSnappingMode`が`DontSnap`以外で、対象Landscapeに付属したFoliageがある場合はApplyを拒否します。設定は変更しません。
+- 円形ブラシの3 Toolは、付属していない（`BaseId`が無効な）Foliageを保護しません。書き込み後のFoliageの検証もありません。
+- 付属の判定は、評価のたびに全LevelのFoliageの全instanceを走査します（上限なし）。数十万instance以上のWorldでは、1回の評価に数msから数十msかかる場合があります。
+- 閾値は固定です（高さは量子化の半段、傾斜は0.01度）。入力では変えられません。
+- Editor worldでは、読み込まれていないstreaming levelへの参照があっても、Editor自身が次のframeで読み込みます。拒否の判定はToolを呼んだ時点の状態で行います。
+
+## Landscape Grass
+
+v0.5.0では、Landscape Grass Output（またはGrass Type）を使うLandscapeへの編集は非対応です。
+
+- v0.4の3 ToolのApplyは`UNSUPPORTED_GRASS_STATE`で拒否します。Dry-runの`foliage`では`LANDSCAPE_GRASS`として`UNKNOWN`になります。
+- 円形ブラシの3 ToolのApplyも、Grassの状態がある、またはmaterialの中を確かめられないLandscapeを拒否します（`message`の先頭が`UNSUPPORTED_GRASS_STATE:`。v0.5.0 RC2で追加。v0.3〜v0.5.0 RC1は検査していませんでした）。Dry-runは検査しません。
+- Grassの状態: material（Material Instanceの親、Material Function・Function Instance・material layerの関数を、入れ子や共有も含めて最後まで辿る）のLandscape Grass Output、ActorのGrass Type override、Componentのgrass type、生成済みのGrassのcomponentと非同期task。
+- 確かめられない構成として拒否するもの（v0.5.0 RC3で拡大）: 親のないMaterial Instance・Material Function Instance、関数を指定していないFunction Call、参照の循環（Material Instanceの親、関数の呼び出し）、editor dataのないmaterial・material function、解析の上限（参照の深さ64、解析するmaterial・function 4,096、expression 262,144）の超過、material layerを使うmaterialのMaterial Instance（layerの差し替え先を確かめないため）。空のlayer slotや、LODの上書きの空slotは拒否しません。解析は読み取りだけで、materialを変更・修復しません。
+- 判定の後も、書き込む直前と書き込んだ直後に、Grassの状態、material、materialのgraph（同じmaterialへのexpressionの追加など、その場での変更を含む）が判定時と同じことを確かめます。Editor拡張などが`Modify`や`MarkPackageDirty`の通知の中でこれらを変えた場合、書き込む前なら何も書き込まずに拒否し、書き込んだ後なら本Pluginのtransactionを1件だけUndoして拒否します（`message`はどちらも`UNSUPPORTED_GRASS_STATE:`で始まります）。Undoの後に、高さ、material・graph・Grass、Undo履歴、packageのdirtyがすべて書き込み前と同じことを確かめられた場合だけ`rollback completed`とします。確かめられない場合（listenerがtransactionの外でmaterialを変えた場合など。本Pluginはその変更を書き戻しません）は`rollback FAILED`とし、そのmodule sessionの間は円形ブラシ3 Toolの書き込みを止めます（`BRUSH_WRITES_DISABLED:`）。この照合は、Grassの状態と、解析で辿る定義済みの参照構造（material、Material Instanceの親、material function、expressionの並び）が同じことを確かめるものです。expressionの値（定数など）を含む、materialのすべてのpropertyが完全に元へ戻ることを保証するものではありません。
+- 既知の問題: v0.4の3 Tool（`FlattenRectangle`、`FlattenPath`、`CreateWalkablePath`）で、書き込んだ後にGrassの状態が変わった場合（Editor拡張の通知などによる）、`errorCode`は`UNSUPPORTED_GRASS_STATE`ではなく`FOLIAGE_SAFETY_CONFLICT`（`message`の先頭は`FOLIAGE_POST_VERIFY`）になります。rollbackとlatchは正しく動作します。分類の修正は後続のバージョンで検討します。
+- Grassのない独自materialは、円形ブラシで編集できます。GrassはUEが地形の変更後に再生成するため、Grassのinstanceは保護も検証もされません。
+- 将来の検討事項（未実装・時期未定）: Grassを使うLandscapeへの安全な編集を、将来のバージョンで検討します。特定のバージョンでの実装は約束していません。
+
+## Water System・Spline・保護領域
+
+v0.5.0は、Unreal EngineのWater SystemやSplineを使った川・道路などの自動検出、保護領域（編集禁止領域）の設定、地形の変更に合わせた自動追従をサポートしていません。これらを検出・保護・追従する機能はありません。
+
+これらを含む地形について、LandscapeMCPは関連するActorや形状が適切に維持されることを保証しません。川岸、道路、橋、建物などに影響する地形の編集は避けてください。
+
+将来の検討事項（未実装・時期未定）: 編集禁止領域の設定、Water System・Splineへの影響の評価、安全な自動追従を、段階的に検討します。実装するバージョンや時期は未定で、特定のバージョンでの実装は約束していません。
 
 ## 外部制約
 

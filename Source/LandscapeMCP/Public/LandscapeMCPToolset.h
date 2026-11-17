@@ -183,13 +183,108 @@ struct LANDSCAPEMCP_API FLandscapeMCPWalkabilityResult
     UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightCenterCm = 0;
 };
 
+/** GetCapabilitiesの結果。Engine・Adapter・機能ごとの対応状況。読み取り専用。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPCapabilitiesResult
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bSuccess = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Message;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Engine;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString EngineVersion;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Adapter;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString AdapterVersion;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString ToolsetVersion;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString PluginVersionName;
+    /** Buildの識別（Build日時）。同じVersionNameでも中間Buildを区別するため。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString BuildId;
+    /** VERIFIED_APPLY: v0.4の3 Toolは検証付きのApply。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString HeightWrite;
+    /** CODEC_EXACT: Chaos heightfieldの量子化を独立に予測してline traceと照合。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString CollisionVerification;
+    /** OWNED_TRANSACTION: 1回のApplyにつき自分専用のTransactionを1つ。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Undo;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString FoliageInspect;
+    /** PRESERVE_IN_PLACE_ONLY: Foliageを動かさず、影響がある編集は拒否する。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString FoliageApply;
+    /** Project設定 FoliageLandscapeSnappingMode の現在値。DontSnap以外では付属Foliageを持つLandscapeへApplyしない。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString FoliageSnappingMode;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") TArray<FString> UnsupportedFoliageForms;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString WorldPartition;
+    /** rollbackを証明できずApplyが停止している（safety latch）。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bMutationDisabled = false;
+};
+
+/** InspectFoliageの種類別集計。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPFoliageTypeSummary
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString FoliageType;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Mesh;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 Count = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 TargetLandscapeCount = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 OtherComponentCount = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 UnattachedCount = 0;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 UnknownCount = 0;
+};
+
+/** InspectFoliageのinstance 1つ分。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPFoliageInstanceInfo
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString FoliageType;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector Location = FVector::ZeroVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FRotator Rotation = FRotator::ZeroRotator;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FVector Scale = FVector::OneVector;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double ZOffsetCm = 0;
+    /** TARGET_LANDSCAPE / OTHER_COMPONENT / UNATTACHED。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Base;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double TerrainHeightCm = 0;
+    /** Location.Z - TerrainHeightCm。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double HeightAboveTerrainCm = 0;
+    /** instanceのXYを含む実三角形の傾斜。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") double LocalSlopeDegrees = 0;
+    /** 判定できない形式の理由。判定できるinstanceでは空。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString UnknownReason;
+};
+
+/** InspectFoliageの結果。読み取り専用で、Landscape・Foliage・Package・Undo履歴を変更しない。 */
+USTRUCT(BlueprintType)
+struct LANDSCAPEMCP_API FLandscapeMCPFoliageInspectResult
+{
+    GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bSuccess = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString LandscapePath;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Message;
+    /** INSPECTED / NO_FOLIAGE / UNKNOWN_PRESENT（判定不能な形式・状態がある、または走査の上限を超えた）。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString Status;
+    /** 矩形内の全instance数（返却の上限とは無関係）。bInstanceCountExactがfalseなら件数不明として -1。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 InstanceCount = 0;
+    /** InstanceCountが正確な件数か。走査上限を超えた場合false（Types・Instancesも空）。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bInstanceCountExact = true;
+    /** 矩形に重なる候補として走査した数。上限を超えた場合は「上限 + 1」で止まり、実数の下限を表す。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") int32 ScannedInstanceCount = 0;
+    /** 候補が走査上限（65,536）を超えた。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bScanLimitExceeded = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") TArray<FLandscapeMCPFoliageTypeSummary> Types;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") TArray<FLandscapeMCPFoliageInstanceInfo> Instances;
+    /** InstancesをmaxInstancesで切った場合true。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bTruncated = false;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") TArray<FString> Unknowns;
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") FString SnappingMode;
+    /** 対象Landscapeのどれかのcollision componentに付属Foliageがある（矩形の外を含む）。 */
+    UPROPERTY(BlueprintReadOnly, Category="Landscape MCP") bool bTargetHasAttachedFoliage = false;
+};
+
 /** Editor限定。World Partition非使用で、表示・ロック解除済みの標準Edit Layerが1つあるLandscapeのみ対応。保存しない。 */
 UCLASS()
 class LANDSCAPEMCP_API ULandscapeMCPToolset : public UToolsetDefinition
 {
     GENERATED_BODY()
 public:
-    virtual FString GetToolsetVersion() const override { return TEXT("0.4"); }
+    virtual FString GetToolsetVersion() const override { return TEXT("0.5"); }
 
     /** Polylineに沿う帯状領域を平坦化する。widthCmはcoreの全幅、falloffCmはcore外のblend距離。
      * bDryRun=true（既定）は解析とPreviewのみで、地形へ書き込まない。bDryRun=falseは検証後にLandscapeの高さを実際に変更する（1 transaction、Undo可能、Levelは自動保存しない）。
@@ -293,4 +388,18 @@ public:
     UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
     static FLandscapeMCPWalkabilityRegionResult EvaluateWalkabilityRegion(const FString& LandscapePath, double MinX, double MinY,
         double MaxX, double MaxY, double WalkableFloorAngleDeg);
+
+    /** Engine・Adapter・Build・機能ごとの対応状況を返す。読み取り専用で、対象のLandscapeは不要。
+     * foliageApplyとfoliageSnappingModeで、Foliage付きLandscapeへのApplyの条件を確認できる。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPCapabilitiesResult GetCapabilities();
+
+    /** 矩形領域にあるFoliage instanceを、種類・付属先・地形との関係とともに返す詳細調査用。読み取り専用。
+     * 矩形全体がLandscape内に必要。読み取りは最大16384頂点。MaxInstancesは返すinstance数の上限で[0,4096]。
+     * 判定できない形式（Grass、Procedural Foliage、Actor Foliage、他LevelのFoliage）はunknownsに入り、安全とはみなさない。
+     */
+    UFUNCTION(meta=(AICallable, NonTransactableToolCall), Category="Landscape MCP")
+    static FLandscapeMCPFoliageInspectResult InspectFoliage(const FString& LandscapePath, double MinX, double MinY,
+        double MaxX, double MaxY, int32 MaxInstances = 256);
 };

@@ -256,3 +256,109 @@ Automationが確認している主な内容:
 測定した所要時間の例（Ryzen 7 7800X3D、UE5.8 Editor。保証値ではありません）: 幅4m・長さ30m程度の編集のApplyが約6ms、同じrequestの再送が約1ms、上限に近い大きさ（読み取り16384頂点、検証する三角形 約3万枚）のApplyが約100〜140ms。
 
 確認していないこと: UE5.8 / Win64 Editor以外の環境、`RunUAT BuildPlugin`によるv0.4.0のBuild、CharacterMovementやNavMeshでの通行と`CreateWalkablePath`の結果の対応（環境に依存します）、256個を超えるpropがある場合の拒否。
+
+## v0.5.0の検証（2026-11-14、Release Candidate）
+
+Foliage Safetyを追加したv0.5.0の検証です。Buildは、検証用の隔離ProjectへPluginをソースごと置き、Binaries・Intermediateを消してからUnrealBuildTool（UnrealEditor / Win64 / Development）で行いました。
+
+| 項目 | 結果 |
+|---|---|
+| Build（UE5.8.3、Win64 Development Editor、clean build） | 成功 |
+| Automation 91 suite | 91 Success、警告0、失敗0、未実行0（v0.4の60 suite、v0.5の31 suite） |
+| MCP HTTPの往復 | v0.4の往復（Dry-run、Apply、retry、診断、rollback、latch）と、v0.5の往復（`GetCapabilities`、`InspectFoliage`の成功と異常系、Foliage付きの`FlattenRectangle`のDry-runとApplyの拒否）の両方が成功 |
+| 公式schema | Version `0.5`、15 Tool。既存13 Toolは、v0.4.0のtagと比べて、3 Toolの出力`foliage`の追加以外の差なし |
+| Error / Ensure / Fatal | 起動時の`LogAutomationTest: Error: Condition failed` 19件だけ。LandscapeMCPを含まない空Projectでも同じ19件が出るEngine側のもの。Ensure 0、Fatal 0 |
+| Editorでの代表ケース | 非表示sublevelの付属Foliageによる円形ブラシの拒否（6呼び出し）、Foliageのある範囲のApplyの拒否、安全なApply → Undo → Redo（各60 frame後にFoliage不変、高さが元に戻る・再適用される）、読み込まれていないstreaming levelでの書き込みの拒否（円形ブラシ6呼び出しと`FlattenRectangle`）、snap mode（`SnapUnderBrushOnly`、`SnapEverywhere`）による拒否。すべて成功。拒否の前後で地形・Foliage・Undo・dirty・Level状態・保存済みAssetが不変 |
+
+Automationが確認している主な内容（v0.5）:
+
+- **影響の評価**: 実三角形の高さ（bilinearとの違いの反例を含む）、辺・対角線・頂点、Snapshotの端、量子化と傾斜の閾値（直下・一致・直上）、実collisionとの照合
+- **Apply**: Foliageなし・範囲外・範囲内、Undo／Redoと遅延更新、実際のEditor tickでの複数frame後、境界をまたぐ編集、20,000 instance、走査上限ちょうどと超過
+- **判定できない形式と状態**: 非表示・ロック中・別Level・読み込まれていないLevel、Actor Foliage、Procedural、Grass、snap mode、付属先を証明できないinstance（cacheのentry欠損、null、解決できない参照、無効なcomponent、ComponentHashとの不整合）
+- **書き込み直前と書き込み後**: 状態の変化による`preWrite`での拒否、Foliageを本当に動かすfaultでの`postFoliage`、Undoで戻る場合のrollbackと、戻らない場合の`ROLLBACK_FAILED`とlatch
+- **読み取りと互換性**: Foliage付きLandscapeでの読み取りToolの不変性、v0.4.0のschemaとの比較、ToolsetRegistryとPythonからの呼び出し
+
+測定した所要時間の例（Ryzen 7 7800X3D、UE5.8 Editor。保証値ではありません）: 上限に近い大きさのApplyが約100〜130ms、64点の経路の計画が約70ms、範囲外に20,000 instanceがある場合のDry-runが約0.3ms・Applyが約20ms。
+
+確認していないこと（RC1の時点）: UE5.8 / Win64 Editor以外の環境、`RunUAT BuildPlugin`によるv0.5.0のBuild（RC2・RC3で確認済み。下の表を参照）、Levels panelで作った保存済みsublevelをGUIで非表示・unloadした状態での拒否（テストは同等の状態をEditor内で作って確認）、数十万instance以上のWorldでの所要時間。
+
+### RC2（円形ブラシのLandscape Grass判定、2026-11-14）
+
+PR #2のレビューで、円形ブラシ3 ToolがLandscape Grassを検査せずに書き込めることが分かりました。隔離ProjectでRC1のDLLを使って再現し（Grass Outputを持つmaterialとそのMaterial Instanceで、3 ToolのApplyが6件とも書き込んだ）、修正後に同じscriptで拒否されることを確認しました（[v0.5 contract §13.2](v0.5-contract.md)）。
+
+| 項目 | 結果 |
+|---|---|
+| Build（clean build） | 成功。警告はRC1と同じ（C4701が4件、既存のコード） |
+| Automation 92 suite | 92 Success、警告0、失敗0、未実行0（`V05.Resolve.BrushGrassState`を追加） |
+| MCP HTTPの往復 | v0.4・v0.5とも成功 |
+| Error / Ensure / Fatal | RC1と同じ（起動時のEngine側の19件だけ、Ensure 0、Fatal 0） |
+| Editorでの再現と修正の確認 | 修正前: Grassのある2構成 × 3 ToolのApplyが6件とも書き込み。修正後: 6件とも`UNSUPPORTED_GRASS_STATE`で拒否し、高さ・Undo・dirty・materialが不変。Dry-runはどちらも成功。Grassのない独自materialとdefault materialのApplyは、どちらも書き込みとUndoが成功 |
+| Editorでの代表ケース | 非表示sublevelの付属Foliageによる円形ブラシの拒否（6呼び出し）をRC2のDLLで再実行して成功 |
+| 性能（3回） | RC1と同じ範囲（上限に近いApplyが約100〜131ms） |
+| `RunUAT BuildPlugin`（Win64） | `BUILD SUCCESSFUL`、終了コード0（RC2のsource） |
+
+`V05.Resolve.BrushGrassState`が確認していること: 3 Tool × 7構成（Grass Output、そのMaterial Instance、生成済みのGrassのcomponent、material layerのMaterial Instance、付属FoliageとGrassの両方、Grassのない独自material、default material）について、Dry-runの成功と不変性、Applyの拒否または成功、拒否時の高さ・Undo・dirtyの不変性、成功時のUndo、material・Grassのcomponent・Foliageの不変性。平らな地面のSmoothのように書き込みが不要な場合は、Grassがあっても書き込まずに成功すること。
+
+### RC3（Grass判定の完全性と書き込み直前・直後の再検証、2026-11-15）
+
+独立レビュー（MAJOR 2件、MINOR 1件）を受けて、Grassの判定をmaterialのgraphの完全な解析に変え、判定から書き込みまでの状態変化を再検証するようにしました（[v0.5 contract §13.3](v0.5-contract.md)）。反例は、修正前のRC2 DLL（製品sourceは`e37ec16`のまま、テストだけ追加）で1構成ずつ別processとtimeoutを使って再現し、同じテストを修正後のDLLで実行しました。
+
+| 項目 | 修正前（RC2のDLL） | 修正後（RC3） |
+|---|---|---|
+| 判定不能なgraph（親のないMaterial Instance・Function Instance、関数のないFunction Call、親の循環、関数の呼び出しの循環、入れ子のfunctionのeditor dataの欠損） | 10構成 × 3 ToolのApplyが30件とも書き込み | 30件とも書き込まずに拒否。高さ・Undo・dirty・materialが不変 |
+| 入れ子・共有のMaterial Functionの中のGrass Output | 2構成 × 3 Toolの6件とも書き込み（UEの列挙APIが入れ子を見ないため） | 6件とも拒否 |
+| 呼び出すfunctionのeditor dataの欠損 | Editorが停止（`CastChecked`のFatal error） | 拒否 |
+| Function Instanceの中・layerの中のGrass、rootのeditor dataの欠損 | 拒否（RC2で検出できていた） | 拒否 |
+| 解析できるGrassのないgraph（入れ子、共有DAG、instanceの連鎖、空のlayer slot） | 書き込みとUndoが成功 | 書き込みとUndoが成功 |
+| `Actor`・`Info`の`Modify`通知でmaterial・Grassの状態を変える（4構成 × 3 Tool） | 12件とも書き込んで成功を返した | 12件とも書き込まずに拒否。高さ・Undo・dirtyが不変 |
+| 書き込み中の通知で状態を変える（2構成 × 3 Tool） | 6件とも書き込んで成功を返した | 6件ともUndoして拒否（`rollback completed`）。高さが元に戻り、Undoの記録も残らない |
+| 復元を確かめられない場合（automationのfault） | — | `rollback FAILED`で拒否し、以後の円形ブラシのApplyを`BRUSH_WRITES_DISABLED`で拒否 |
+| v0.4の`FlattenRectangle`で`Modify`通知が状態を変える | 書き込んでから事後検証でrollback | 書き込まずに`UNSUPPORTED_GRASS_STATE`（`stage`は`transaction`）で拒否 |
+
+| 項目 | 結果 |
+|---|---|
+| Build（clean build） | 成功。警告はRC1・RC2と同じ（C4701が4件） |
+| Automation | 115件すべてSuccess、警告0、失敗0、未実行0（`V05.Resolve.BrushMaterialGraph`の22構成と`V05.Resolve.BrushGrassReentry`を追加） |
+| MCP HTTPの往復 | v0.4・v0.5とも成功 |
+| Error / Ensure / Fatal | RC2と同じ（起動時のEngine側の19件だけ、Ensure 0、Fatal 0） |
+| 性能（3回） | 上限に近いApplyが約99〜100ms、64点の経路の計画が約65〜67ms、20,000 instanceのApplyが約20〜22ms（RC2と同じ範囲） |
+| `RunUAT BuildPlugin`（Win64） | `BUILD SUCCESSFUL`、終了コード0 |
+
+再現の途中で、次のことが分かりました（証跡に残しています）。
+
+- UEは同じframeの2回目以降の`OnObjectModified`を送りません。最初の試行ではテストのlistenerが呼ばれず、M2を再現できませんでした。テストは、Engineがframeの終わりに行うのと同じく通知済みの集合を空にしてからApplyします。
+- 親が循環するMaterial Instanceは、serializeが戻りません。テストのhashが原因でEditorが応答しなくなったため、テストはfieldを直接読む目印に変えました（製品の解析はserializeしません）。
+- 修正後の最初のテストで、自分自身を呼ぶMaterial Functionを見逃していました（所有元へのback-pointerを値で除いていたため）。propertyで除くように直し、テストで確認しました。
+
+
+### RC4（rollbackの復元保証とobject数の上限、2026-11-17）
+
+RC3の独立レビュー（MAJOR 1件、MINOR 1件）を受けて、最後の再検証から書き込みまでの間の通知をなくし、円形ブラシのUndoの後にmaterial・graph・Grass・Undo履歴・packageのdirtyを照合するようにしました（[v0.5 contract §13.4](v0.5-contract.md)）。反例は、修正前のRC3 DLL（製品sourceは`ecc817e`のまま、テストだけ追加）で1構成ずつ別processとtimeoutを使って再現し、同じテストを修正後のDLLで実行しました。各構成は3 Tool × clean・dirtyの開始状態で、高さ、material・graph、Grass、Undoの件数と最新の記録、packageのdirtyを比べます。
+
+| 項目 | 修正前（RC3のDLL） | 修正後（RC4） |
+|---|---|---|
+| `PackageMarkedDirtyEvent`・書き込み中の通知で、同じmaterialや入れ子のfunctionにGrass Outputを足す（4構成） | Undoの後もGrass Outputが残るのに`rollback completed`とし、latchを掛けなかった | `rollback FAILED`（`After Undo: Landscape Grass Output is present.`）。高さ・Undo履歴・dirtyは元に戻り、listenerの変更はこのToolが書き戻さずに残す。以後の円形ブラシ3 ToolのApplyはすべて`BRUSH_WRITES_DISABLED`で拒否（高さ・Undo・dirtyが不変、Dry-runは可） |
+| 書き込み中に入れ子のfunctionのgraphを変える（Grassなし） | 書き込んで成功を返した | `rollback FAILED`（graphの目印が一致しない）とlatch |
+| `PackageMarkedDirtyEvent`・書き込み中にActorのmaterialをGrassのあるものに差し替える | `rollback completed`（ActorはUndoで戻る） | 同じ。Undo後のmaterial・graph・dirty・Undo履歴の一致を確かめたうえで`rollback completed`。拒否した書き込みはRedoできない |
+| 最新のUndoの記録が自分のものでない（automationのhookで無関係なtransactionを入れる） | 対象外（RC3にhookがない） | Undoせずに`rollback FAILED`（所有を証明できない）とlatch |
+| 通常のApply → Undo → Redo | 成功 | 成功。Undoで高さ・dirty・Undo履歴が戻り、Redoで書き込みが戻る |
+| v0.4の`FlattenRectangle`で`PackageMarkedDirtyEvent`がmaterialを差し替える・default materialにGrass Outputを足す | rollbackが`VERIFIED`・`FAILED`（latch） | 同じ（v0.4は事後検証の`CaptureTarget`でGrassを検出する） |
+| 解析するobjectの数: 4,095・4,096・4,096（末尾に呼び出しの連鎖）・4,096（各functionを2回呼ぶ共有DAG） | 解析して成功 | 同じ |
+| 解析するobjectの数: 4,097・4,097（末尾に呼び出しの連鎖） | 上限を超えても解析して書き込んだ | `analysis limit exceeded`で拒否 |
+
+| 項目 | 結果 |
+|---|---|
+| Build（clean build） | 成功。警告はRC1〜RC3と同じ（C4701が4件） |
+| 反例の構成（1構成1 process、28件） | 修正前（RC3のDLL）は14件Fail・14件Success。Failのうち、最新のUndoの記録が自分のものでない構成（O1）のclean・dirtyの2件は、RC3にhookがなく構成を作れない対象外のケースで、RC3の欠陥の再現ではない（RC3の欠陥を再現したのは12件）。修正後は28件すべてSuccess。timeout・crashなし |
+| 限定suite（`V05.Resolve.*`、`V04.Safety.GrassGuardAndOuterTransaction`、`V05.Foliage.UnknownForms`） | 58件すべてSuccess、警告0 |
+| Automation | 143件すべてSuccess、失敗0、未実行0。警告1件はEngineのネットワーク到達確認（`LogHttp`のtimeout）で、本Pluginとは無関係 |
+| MCP HTTPの往復 | v0.4・v0.5とも成功 |
+| Error / Ensure / Fatal | RC3と同じ19件（本文も一致）、Ensure 0、Fatal 0 |
+| 性能（3回） | 上限に近いApplyが約96〜116ms、矩形が約7〜8ms、64点の経路の計画が約65〜66ms、20,000 instanceのApplyが約19〜23ms（RC2・RC3と同じ範囲） |
+| `RunUAT BuildPlugin`（Win64） | `BUILD SUCCESSFUL`、終了コード0 |
+
+再現の途中で、次のことが分かりました（証跡に残しています）。
+
+- 最初の試行では、通常のApply → Undo → RedoのテストがRC3でも失敗しました。テストが`UndoTransaction(false)`（Redoなし）でUndoしていたためです。テストを`UndoTransaction(true)`に直し、反例をすべて実行し直しました。
+- `UndoTransaction(false)`は、Undoしたtransactionをbufferから外します。製品のrollbackもこのUndoを使うため、Undo履歴の照合は「自分のtransactionが残っていない」ことを確かめる形にしました。
+- v0.4の3 Toolで、書き込み後にGrassの状態が変わった場合の`errorCode`は`FOLIAGE_SAFETY_CONFLICT`（`FOLIAGE_POST_VERIFY`）になります（RC3から同じ。rollbackとlatchは正しく動作）。

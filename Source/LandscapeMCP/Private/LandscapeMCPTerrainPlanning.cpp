@@ -131,14 +131,15 @@ bool PlanWalkableProfile(TConstArrayView<FStation> S,TConstArrayView<double> H,d
     }
     return true;
 }
-FLandscapeMCPTerrainOperationResult Preview(const FPreviewRequest& R,FString* OutFailureStage)
+FLandscapeMCPTerrainOperationResult Preview(const FPreviewRequest& R,FString* OutFailureStage,FHeightfieldSnapshot* OutSnapshot,FPreparedTerrainPlan* OutPlan)
 {
     auto O=Initial(R);FPath P;FVector2D Min,Max;FString Code,Error;
     auto Stage=[&](const TCHAR* S){if(OutFailureStage)*OutFailureStage=S;};
     if(!ValidateRequest(R,P,Min,Max,Code)){Stage(TEXT("validation"));return Reject(O,Code);}
     FHeightfieldSnapshot S;
     if(!ReadSnapshot(R.LandscapePath,Min,Max,S,Code,Error)){Stage(TEXT("snapshot"));return Reject(O,Code,Error);}
-    O=PlanPreview(R,S);if(!O.bSuccess)Stage(TEXT("planning"));
+    O=PlanPreview(R,S,OutPlan);if(!O.bSuccess)Stage(TEXT("planning"));
+    if(OutSnapshot)*OutSnapshot=MoveTemp(S);
     return O;
 }
 FLandscapeMCPTerrainOperationResult PlanPreview(const FPreviewRequest& R,const FHeightfieldSnapshot& S,FPreparedTerrainPlan* Prepared)

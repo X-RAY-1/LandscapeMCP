@@ -5,8 +5,8 @@ Unreal EngineのLandscapeを、AI Agent / MCPクライアントから安全に�
 Unreal Engine 5.8の公式Model Context Protocol（`ToolsetRegistry` → `ModelContextProtocol`）へ、追加Toolsetとして登録されるEditor Pluginです。独立したMCP Serverは含みません。
 
 - Toolset名: `LandscapeMCP.LandscapeMCPToolset`
-- Toolset Version: `0.4`（13 Tool）
-- 現在のリリース: v0.4.0（実験的。Plugin descriptorでも`IsExperimentalVersion`を指定しています）
+- Toolset Version: `0.5`（15 Tool）
+- 現在のリリース: v0.5.0（実験的。Plugin descriptorでも`IsExperimentalVersion`を指定しています）
 - 配布形態: ソースのみ。Build済みのBinariesは配布していません
 
 ## デモ（v0.4）
@@ -33,7 +33,9 @@ AI AgentがLandscapeを扱うときに必要な「作る → 編集する → �
 
 v0.3までは円形ブラシによる局所的な編集と地形の解析が中心でした。v0.4では、矩形の整地、経路に沿った平坦化、勾配を抑えた歩ける道の作成という、ゲームの地形づくりで実際に使う単位の編集Toolを追加しています。
 
-対象は明示された1つのLandscapeだけです。名前やラベルからの推測、対象がない場合の自動作成、保存は行いません。対応していない構成のLandscapeは、編集も読み取りも拒否します。対応範囲は[Limitations](#limitations)を先に確認してください。
+v0.5では、Foliageが付いたLandscapeを扱えるようにしました（[Foliage Safety](#foliage-safetyv05)）。Foliageを動かす・消す・置き直す機能はありません。Foliageへの影響をDry-runで予測し、影響がある場合や判断できない場合はApplyを拒否します。
+
+対象は明示された1つのLandscapeだけです。名前やラベルからの推測、対象がない場合の自動作成、保存は行いません。対応していない構成のLandscapeは、編集を拒否します（多くの構成は読み取りも拒否します）。対応範囲は[Limitations](#limitations)を先に確認してください。
 
 ## 主な機能
 
@@ -43,6 +45,7 @@ v0.3までは円形ブラシによる局所的な編集と地形の解析が中�
 - **高さの取得**: 1点、または矩形領域をまとめて取得
 - **傾斜の解析**: 指定位置の代表的な傾斜と向き、周囲の実三角形から求めた局所的な最大・平均傾斜
 - **歩行可能性の評価**: 呼び出し側が渡した歩行可能角に対する、1点または領域のgeometry評価
+- **Foliage Safety（v0.5）**: 地形authoringの3 ToolがFoliageへの影響（浮く・埋まる・傾斜の変化・Engineによる移動）を予測し、影響がない場合だけ書き込む。Foliageの詳細調査（`InspectFoliage`）と、対応機能の一覧（`GetCapabilities`）
 
 書き込みToolはすべて、Dry-run（既定）で結果を確認してから本実行する形です。本実行はEditorのUndo／Redoで戻せます。保存はしません。
 
@@ -62,6 +65,15 @@ v0.3までは円形ブラシによる局所的な編集と地形の解析が中�
 3 Toolは共通の結果（Terrain Operation Result）を返します。変更前・計画後・実測後の高さと傾斜の統計、変更頂点数、範囲、経路の縦断profile、警告、rollbackの状態を含みます。
 
 入力と結果の定義は[v0.4 Tool仕様](docs/v0.4-tools.md)、本実行の検証手順と失敗時の挙動は[v0.4 Apply contract](docs/v0.4-apply.md)にあります。
+
+### Foliage SafetyとCapability（v0.5で追加）
+
+| Tool | 種別 | 概要 |
+|---|---|---|
+| `GetCapabilities` | 読み取り | Engine・Adapter・Toolset・Pluginの版と、機能ごとの対応状況（Foliageの扱い、World Partition、現在のsnap modeなど）を返す。対象のLandscapeは不要 |
+| `InspectFoliage` | 読み取り | 矩形内のFoliage instanceを、種類ごとの集計と一覧（上限4096件、既定256件）で返す。各instanceの付属先、足元の地形高度、地形からの高さ、局所傾斜と、判定できない形式・状態（`unknowns`）を含む |
+
+どちらもLandscape・Foliage・Package・Undo履歴を変更しません。入力と出力の定義は[v0.5 実装契約](docs/v0.5-contract.md)の§4にあります。
 
 ### 作成・円形ブラシ・解析
 
@@ -126,7 +138,47 @@ Landscapeの上下にStaticMeshなどのprop（WorldStaticのcollision）があ�
 - propは動かしません。地形を変更してもpropは追従しないので、浮いたり埋まったりします。
 - 検証するのは対象Landscapeのcollisionだけです。propの形や、propとの干渉は見ません。
 - 読み飛ばせるのは1回の検証で256 componentまでです。それより多い場合は拒否します。
-- Landscapeに付属したFoliage（Foliage toolで地形に貼り付けたinstance）は、従来どおり拒否します。
+- Foliage instanceはprop扱いではなく、v0.5の[Foliage Safety](#foliage-safetyv05)で評価します。
+
+## Foliage Safety（v0.5）
+
+v0.5は、Foliageを壊さないことを優先しています。Foliageを書き換えるApplyはありません。
+
+**v0.4の3 Tool（`FlattenRectangle`、`FlattenPath`、`CreateWalkablePath`）**
+
+結果に`foliage`を追加しました（既存のfieldは変更なし）。読み取り範囲内の各instanceについて、計画どおりに書き込んだ場合を予測します。
+
+| 分類 | 意味 |
+|---|---|
+| `UNCHANGED` | 足元の高さと傾斜が変わらない |
+| `FLOATING` / `BURIED` | 地形が下がって浮く／上がって埋まる（予測量cm） |
+| `SLOPE_CHANGED` | 高さは変わらないが、足元の三角形の傾斜が変わる |
+| `MAY_BE_MOVED_BY_ENGINE` / `MAY_BE_DELETED_BY_ENGINE` | Project設定のsnap modeにより、UEがTransactionの外でinstanceを動かす・消す可能性がある |
+| `UNKNOWN` | 判定できない（下の非対応の形式・状態、読めない地形） |
+
+足元の高さは、Landscapeが実際に描画・衝突判定する三角形（対角線00-11）から求めます。`GetHeight`などの読み取りToolが返すbilinear補間の高さとは別の定義です。閾値は固定で、高さは量子化の半段、傾斜は0.01度を超えたら変化ありです。
+
+全体の判定（`foliage.verdict`）が`NO_FOLIAGE`か`SAFE_TO_APPLY`のときだけ、Applyは書き込みます。それ以外は`FOLIAGE_SAFETY_CONFLICT`で拒否し、何も書き込みません。Applyは書き込み直前にFoliageを取り直して、instance・snap mode・判定不能な状態が変わっていないことを確かめます（変わっていれば`stage`は`preWrite`）。書き込み後は、遅延していたLandscapeの更新を流してから、全LevelのFoliage Actorが1 byteも変わっていないことと、足元の地形が予測どおりであることを検証します。一致しなければ自分のTransactionだけをUndoし、Foliageを含めて元に戻ったことを確かめます（v0.4と同じrollbackとsafety latch）。
+
+**拒否する条件（Apply）**
+
+- 範囲内のinstanceが1つでも`UNCHANGED`以外
+- Project設定`FoliageLandscapeSnappingMode`が`DontSnap`以外で、対象Landscapeに付属したinstanceがある（範囲の外を含む）。設定は変更しません
+- 判定できない形式・状態: Landscape Grass、Procedural Foliage、Actor Foliage、対象と別のLevelにあるFoliage（非表示・ロック中のLevelを含む）、読み込まれていないstreaming level、走査の上限（65,536 instance）の超過、付属先を証明できないinstance
+
+**円形ブラシの3 Tool（`SculptRegion`、`SmoothRegion`、`FlattenRegion`）**
+
+v0.4と同じく、対象Landscapeに付属したFoliageがあれば、Dry-runもApplyも拒否します。v0.5では、非表示・ロック中のLevelにあるFoliageと、付属先を証明できないinstanceも付属として扱います。読み込まれていないstreaming levelがあるWorldでは、書き込みを拒否します。Landscape Grassがある、またはmaterialの中を確かめられないLandscapeへのApplyも拒否します（下の[Limitations](#limitations)の「Landscape Grass」）。
+
+**読み取りTool**
+
+v0.4ではFoliageが付いたLandscapeを読み取りも拒否していましたが、v0.5では`GetHeight`などの6 Tool、`InspectFoliage`、`GetCapabilities`、3 ToolのDry-runが使えます。読み取りはLandscapeもFoliageも変更しません。
+
+**既知の制限**
+
+- **円形ブラシは付属していないFoliageを保護しない**: 円形ブラシの3 Toolは付属の有無だけを見て、書き込み後のFoliageの検証をしません。対象Landscapeに付属していない（`BaseId`が無効な）instanceが範囲内にあると、地形の変更で浮いたり埋まったりします。v0.4からの制限です。Foliageがある場所の編集には、v0.4の3 Toolを使ってください
+- **全instanceの走査**: 付属の判定は、評価のたびに全LevelのFoliageの全instanceを1回ずつ走査します（上限なし）。数十万instance以上のWorldでは、1回の評価に数msから数十msかかる場合があります。範囲内の分類は、読み取り範囲に重なる65,536 instanceまでです
+- **Foliageを動かすApplyはない**: 影響がある編集は拒否するだけです。Foliageを先に動かすか、別の場所を編集してください
 
 ### 同じrequestの再送（retry）
 
@@ -185,6 +237,8 @@ Build Moduleの依存はCore、CoreUObject、Engine、ToolsetRegistry、Landscap
 
 BuildしたBinariesは、Buildに使ったEngineでだけ読み込めます。Engineを更新した場合はBuildし直してください。
 
+**Windowsのパス長の注意**: Windowsでは、ディレクトリのパスが長いとUnrealBuildToolや`RunUAT BuildPlugin`が失敗する場合があります（中間ファイルのパスが260文字の制限を超えるため）。Pluginの展開先、Projectの配置先、`-Package`の出力先には、`D:/Build/LMCP`のような短いパスを使ってください。長いパスで失敗した場合は、まず短いパスで再試行してください。
+
 ### Pluginの有効化と検出の確認
 
 1. `<Project>/Plugins/LandscapeMCP/`にPluginが置かれていることを確認し、Unreal Engine 5.8でProjectを開きます。
@@ -193,7 +247,7 @@ BuildしたBinariesは、Buildに使ったEngineでだけ読み込めます。En
 4. Editorから再起動を求められたら、再起動します。
 5. Model Context Protocol側で、All ToolsetsまたはLandscapeMCPのToolsetを有効にします。
 6. MCPクライアントをEditorのMCP Serverへ接続します。接続先はModel Context Protocol Pluginの設定に従ってください。検証環境では`http://127.0.0.1:8000/mcp`（HTTP）でした。
-7. `list_toolsets`に`LandscapeMCP.LandscapeMCPToolset`が現れ、`describe_toolset`でVersion `0.4`と13 Toolが返ることを確認します。
+7. `list_toolsets`に`LandscapeMCP.LandscapeMCPToolset`が現れ、`describe_toolset`でVersion `0.5`と15 Toolが返ることを確認します。`GetCapabilities`の`pluginVersionName`が`0.5.0`であることでも、Buildした版を確認できます。
 
 Pluginsの画面を使わない場合は、`.uproject`の`Plugins`へ`{"Name": "LandscapeMCP", "Enabled": true}`と`{"Name": "ModelContextProtocol", "Enabled": true}`を追加しても同じです。
 
@@ -286,7 +340,7 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - エラーが返ったら、それに依存する後続の処理を止めます。別の対象を推測して続行しないでください。
 - 編集の取り消しには、Editorの通常のUndoを使います。
 - `ROLLBACK_FAILED`が返ったら、編集を止めて地形の状態を確認してください。
-- PIE中は13 Toolすべてが使えません。
+- PIE中は15 Toolすべてが使えません。
 
 ## Safety design
 
@@ -298,7 +352,8 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - **Undo / Redo**: 実編集はTransactionとして記録され、EditorのUndo／Redoで戻せます。v0.4の3 Toolは、1回のApplyにつきTransactionを1つだけ作ります。
 - **rollback失敗時の停止**: 元に戻ったことを証明できない場合は、Editorを再起動するまでv0.4の3 ToolのApplyを止めます。
 - **保存しない**: 保存・Autosave APIを呼びません。Editorの設定も変更しません。ただし実編集はPackageをdirtyにします。v0.4の3 ToolのApplyは、AutosaveやSource Controlの自動checkoutが有効な場合は拒否します。
-- **read-onlyの分析Tool**: `GetHeight`、`GetSlope`、`GetHeightRegion`、`EvaluateWalkability`、`AnalyzeSlopeNeighborhood`、`EvaluateWalkabilityRegion`は、Transaction・Modify・Package dirty化を行いません。
+- **read-onlyの分析Tool**: `GetHeight`、`GetSlope`、`GetHeightRegion`、`EvaluateWalkability`、`AnalyzeSlopeNeighborhood`、`EvaluateWalkabilityRegion`、`InspectFoliage`、`GetCapabilities`は、Transaction・Modify・Package dirty化を行いません。
+- **Foliageを保護する（v0.5）**: Foliageへの影響がある、または判断できない編集は書き込まずに拒否します。Foliageは書き換えません。詳細は[Foliage Safety](#foliage-safetyv05)にあります。
 - **PIE / Save / GC中は拒否**: Editorのgame thread上、現在のEditor Worldだけを対象とし、PIE中・Package保存中・GC中は読み取りも拒否します。
 - **fail-closed**: 入力や対象が不明・不正な場合、対応していない状態の場合は、実行せずにFAILします。NaN／Infinity、範囲外、逆転した範囲を拒否します。
 - **上限**: 作成は262144 Sample、編集は16384 Sample、領域の高さ取得は1024 Sample、実三角形の解析は16384頂点まで。v0.4の3 Toolは経路64点・長さ100m、幅と矩形の辺50m、falloff 25m、高さの変更量10mまで。
@@ -315,7 +370,26 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - 読み込み済みの単一の`ALandscape`だけ。World Partition、external actorを使うLevel、Landscape Streaming Proxy、Landscapeの派生classは非対応
 - 回転していないこと。Scaleは各軸とも正で[1,1000]
 - 標準のEdit Layerが1つだけで、表示・ロック解除・height alphaが1。複数または特殊なEdit Layer、Blueprint brushは非対応
-- Nanite Landscape、Visibility Hole、付属Foliageは非対応
+- Nanite Landscape、Visibility Holeは非対応
+- Foliageの扱いは[Foliage Safety](#foliage-safetyv05)のとおり。Landscape Grass、Procedural Foliage、Actor Foliage、他のLevelのFoliage、読み込まれていないstreaming levelは判定できないものとして扱い、地形authoringのApplyを拒否します
+
+**Landscape Grass（v0.5.0では非対応）**
+
+- Landscape Grass Output（またはGrass Type）を使うLandscapeへの編集は、v0.5.0では非対応です。
+- v0.4の3 ToolのApplyは、Grassの状態があるLandscapeを`UNSUPPORTED_GRASS_STATE`で拒否します。Dry-runの`foliage`ではGrassを判定できないもの（`LANDSCAPE_GRASS`）として扱い、`UNKNOWN`になります。
+- 円形ブラシの3 Tool（`SculptRegion`、`SmoothRegion`、`FlattenRegion`）のApplyも、Grassの状態があるLandscapeを拒否します。`message`の先頭は`UNSUPPORTED_GRASS_STATE:`です。Dry-runはGrassを検査せず、v0.4の3 Toolと同じく成功します。書き込みが不要な場合（変化0）は、従来どおり何も書き込まずに成功します。
+- Grassの状態として扱うもの: material（Material Instanceの親、Material Function・Function Instance・material layerの関数を、入れ子や共有も含めて最後まで辿る）のLandscape Grass Output、ActorのGrass Type override、Componentのgrass type、生成済みのGrassのcomponentと非同期task。
+- materialの中を最後まで確かめられない構成も、Grassがないと証明できないため拒否します: 親のないMaterial Instance・Material Function Instance、関数を指定していないFunction Call、参照の循環（Material Instanceの親、関数の呼び出し）、editor dataのないmaterial・material function、解析の上限（参照の深さ64、解析するmaterial・function 4,096、expression 262,144）の超過、material layerを使うmaterialのMaterial Instance（layerの差し替え先を確かめないため）。空のlayer slotや、LODの上書きの空slotは拒否しません。解析は読み取りだけで、materialを変更・修復しません。
+- 判定の後も、書き込む直前と書き込んだ直後に、Grassの状態、material、materialのgraph（同じmaterialへのexpressionの追加など、その場での変更を含む）が判定時と同じことを確かめます。Editor拡張などが`Modify`や`MarkPackageDirty`の通知の中でこれらを変えた場合、書き込む前なら何も書き込まずに拒否し、書き込んだ後なら本Pluginのtransactionを1件だけUndoして拒否します（`message`はどちらも`UNSUPPORTED_GRASS_STATE:`で始まります）。Undoの後に、高さ、material・graph・Grass、Undo履歴、packageのdirtyがすべて書き込み前と同じことを確かめられた場合だけ`rollback completed`とします。確かめられない場合（listenerがtransactionの外でmaterialを変えた場合など。本Pluginはその変更を書き戻しません）は`rollback FAILED`とし、そのmodule sessionの間は円形ブラシ3 Toolの書き込みを止めます（`BRUSH_WRITES_DISABLED:`）。この照合は、Grassの状態と、解析で辿る定義済みの参照構造（material、Material Instanceの親、material function、expressionの並び）が同じことを確かめるものです。expressionの値（定数など）を含む、materialのすべてのpropertyが完全に元へ戻ることを保証するものではありません。
+- 既知の問題: v0.4の3 Tool（`FlattenRectangle`、`FlattenPath`、`CreateWalkablePath`）で、書き込んだ後にGrassの状態が変わった場合（Editor拡張の通知などによる）、`errorCode`は`UNSUPPORTED_GRASS_STATE`ではなく`FOLIAGE_SAFETY_CONFLICT`（`message`の先頭は`FOLIAGE_POST_VERIFY`）になります。rollbackとlatchは正しく動作します。分類の修正は後続のバージョンで検討します。
+- Grassを使わない独自materialのLandscapeは、円形ブラシで従来どおり編集できます（v0.4の3 ToolのApplyは、従来どおりEngineのdefault materialだけ）。GrassはUEが地形の変更後に再生成するため、本PluginはGrassのinstanceを保護も検証もしません。
+- 将来の検討事項（未実装・時期未定）: Grassを使うLandscapeへの安全な編集を、将来のバージョンで検討しています。実装するバージョンや時期は決まっていません。
+
+**Water System・Spline・保護領域（v0.5.0では非対応）**
+
+- v0.5.0は、Unreal EngineのWater SystemやSplineを使った川・道路などの自動検出、保護領域（編集禁止領域）の設定、地形の変更に合わせた自動追従をサポートしていません。これらを検出・保護・追従する機能はありません。
+- これらを含む地形について、LandscapeMCPは関連するActorや形状が適切に維持されることを保証しません。川岸、道路、橋、建物などに影響する地形の編集は避けてください。
+- 将来の検討事項（未実装・時期未定）: 編集禁止領域の設定、Water System・Splineへの影響の評価、安全な自動追従を、段階的に検討します。実装するバージョンや時期は決まっていません。
 
 **v0.4の3 ToolのApplyに追加で必要な条件**
 
@@ -340,7 +414,8 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - **中心傾斜は対称な地形で0になる**: 上の[中心傾斜と局所最大傾斜](#中心傾斜と局所最大傾斜)を参照してください。
 - **retryの冪等性には期限がある**: 上の[同じrequestの再送](#同じrequestの再送retry)を参照してください。
 - **別のUEバージョンは未検証**: UE5.8 / Win64 Editor以外では検証していません。三角形分割（対角線00-11）とcollisionの量子化は、UE5.8のEngineソースとline traceで確認したものです。
-- **未実装**: 経路探索、回転した矩形、不可歩行領域の自動修正、World Partition対応はありません。
+- **未実装**: 経路探索、回転した矩形、不可歩行領域の自動修正、World Partition対応、Landscape Grassを使うLandscapeへの編集、Water System・Splineの検出・保護・自動追従、保護領域の設定、Foliageを動かす・置き直す編集はありません。
+- **Foliage Safetyの制限**: 円形ブラシは付属していないFoliageを保護しません。付属の判定は全instanceを走査します。上の[既知の制限](#foliage-safetyv05)を参照してください。
 
 全体は[制限一覧](docs/limitations.md)にあります。
 
@@ -353,7 +428,7 @@ PCG、Modeling、Scriptable Toolsなど、他のPluginは本Pluginの依存で�
 - [開発手順](docs/development.md): 構成、Build、Automationの実行方法
 - [検証要約](docs/testing.md): これまでに行った検証の範囲と結果
 
-Automation Testは60 suiteあります。
+Automation Testは143件あります（`LandscapeMCP.V05.Resolve.BrushMaterialGraph`の28構成と`LandscapeMCP.V05.Resolve.BrushRollbackProof`の22構成を1件ずつ数えます）。
 
 | suite | 対象 |
 |---|---|
@@ -361,6 +436,7 @@ Automation Testは60 suiteあります。
 | `LandscapeMCP.V02.TerrainAnalysis` | 傾斜・領域の高さ・歩行可能性・量子化誤差の上限・read-only |
 | `LandscapeMCP.V03.TerrainHardening` | 実三角形・近傍解析・領域の歩行可能性・Collisionの三角形分割の確認 |
 | `LandscapeMCP.V04.*`（57 suite） | v0.4の3 Tool: 計画、公式schema、Dry-runの不変性、Apply、Undo／Redo、retry、fault注入によるrollbackとlatch、collisionの量子化、prop、保存と副作用がないこと、MCPの往復 |
+| `LandscapeMCP.V05.*`（83件） | Foliage Safety: 影響の分類と実三角形の高さ、collisionとの照合、Foliageなし・範囲外・範囲内、Undo／Redoと複数frame後、非表示・ロック中・別Level・未ロードのLevel、Actor Foliage・Procedural・Grass、snap mode、走査上限、書き込み直前の再確認、事後検証とrollback、円形ブラシの付属判定とGrass判定（materialのgraphの解析、書き込み直前・直後の再検証）、読み取りToolの不変性、v0.4.0のschemaとの互換、HTTPとPythonからの呼び出し |
 
 Automationは新しい未保存Mapを作り、Undo履歴も使います。作業中のEditorではなく、検証用の別Projectで実行してください。実行方法と前提は[開発手順](docs/development.md)にあります。
 

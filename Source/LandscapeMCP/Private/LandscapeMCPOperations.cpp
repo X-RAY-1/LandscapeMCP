@@ -4,6 +4,13 @@
 #include "LandscapeMCPPathSampling.h"
 #include "LandscapeMCPApply.h"
 #include "LandscapeMCPCollisionModel.h"
+#include "LandscapeMCPEngineAdapter.h"
+#include "LandscapeMCPFoliageImpact.h"
+#include "LandscapeSettings.h"
+#include "InstancedFoliage.h"
+#include "FoliageInstanceBase.h"
+#include "FoliageType_InstancedStaticMesh.h"
+#include "ProceduralFoliageComponent.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -14,6 +21,13 @@
 #include "LandscapeHeightfieldCollisionComponent.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionLandscapeGrassOutput.h"
+#include "Materials/MaterialExpressionMaterialAttributeLayers.h"
+#include "Materials/MaterialExpressionMaterialFunctionCall.h"
+#include "Materials/MaterialFunction.h"
+#include "Materials/MaterialFunctionInstance.h"
+#include "Materials/MaterialInstance.h"
+#include "UObject/UnrealType.h"
+#include "UObject/ObjectKey.h"
 #include "Serialization/ObjectWriter.h"
 #include "Misc/Crc.h"
 #include "GameFramework/WorldSettings.h"
@@ -32,6 +46,7 @@
 #include "LandscapeInfo.h"
 #include "LandscapeStreamingProxy.h"
 #include "LevelUtils.h"
+#include "Engine/LevelStreaming.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
 
@@ -69,6 +84,84 @@ namespace
         { Error = TEXT("Hidden or locked Levels are unsupported."); return false; }
         return true;
     }
+    // Worldに読み込まれているすべてのLandscape proxy（非表示・ロック中のLevelを含む）。
+    // TActorIterator<>の既定（OnlyActiveLevels）は非表示Levelを飛ばすため使わない。Editorで非表示にした
+    // streaming levelはWorld->Levelsに残る（bIsVisible=false）ので、そこにあるproxyもここで見つかる。
+    // 読み込まれていないstreaming levelの数をOutUnloadedへ返す（中身は検査できない）。
+    TArray<ALandscapeProxy*> LoadedProxies(UWorld* World, int32* OutUnloaded = nullptr)
+    {
+        TArray<ULevel*> Levels; TArray<FString> Unloaded;
+        Authoring::LoadedLevels(World, Levels, &Unloaded);
+        if (OutUnloaded) { *OutUnloaded = Unloaded.Num(); }
+        TArray<ALandscapeProxy*> Out;
+        for (ULevel* Level : Levels)
+            for (AActor* Actor : Level->Actors)
+                if (ALandscapeProxy* Proxy = Cast<ALandscapeProxy>(Actor); IsValid(Proxy)) { Out.Add(Proxy); }
+        return Out;
+    }
+    // Worldに読み込まれているすべてのLevel（非表示・ロック中を含む）のIFA。読み取りのみ。
+    TArray<AInstancedFoliageActor*> LoadedFoliageActors(UWorld* World)
+    {
+        TArray<ULevel*> Levels; Authoring::LoadedLevels(World, Levels, nullptr);
+        TArray<AInstancedFoliageActor*> Out;
+        for (ULevel* Level : Levels)
+            for (AActor* Actor : Level->Actors)
+                if (AInstancedFoliageActor* IFA = Cast<AInstancedFoliageActor>(Actor); IsValid(IFA)) { Out.Add(IFA); }
+        return Out;
+    }
+    // 対象Landscapeのcollision componentへの付属Foliage（読み取りのみ。IFAもcacheも変更せず、参照の自動ロードもしない）。
+    // AInstancedFoliageActor::HasFoliageAttachedは表示中のLevelのIFAしか見ないため使わない。優先順位は Attached > Unresolved > None。
+    //  - Attached: どれかのIFAのbase cacheに対象のcollision componentが登録されている（instanceが使っていないstaleなIDも含む。
+    //    v0.4のHasFoliageAttachedより緩めない）。または、ID→baseの対応が対象を指している。または、使用中のBaseIdが対象へ解決される。
+    //  - Unresolved: 使用中の有効なBaseIdについて、cacheのentryが無い／BasePtrがnull／SoftObjectPathを解決できない（読み込まれていない）
+    //    ／componentが無効（garbage・Owner無効）、または実instanceのBaseIdとComponentHashが一致しない。付属先を証明できない。
+    //  - None: 使用中の有効なBaseIdがすべて有効な別componentへ解決でき、対象へ付属していないと確認できた場合だけ。
+    enum class EFoliageAttachment : uint8 { None, Attached, Unresolved };
+    EFoliageAttachment TargetFoliageAttachment(const ALandscape* Target)
+    {
+        TArray<UActorComponent*> Collision;
+        for (ULandscapeComponent* C : Target->LandscapeComponents)
+            if (C && C->GetCollisionComponent()) { Collision.Add(C->GetCollisionComponent()); }
+        bool bUnresolved = false;
+        for (const AInstancedFoliageActor* IFA : LoadedFoliageActors(Target->GetWorld()))
+        {
+            const FFoliageInstanceBaseCache& Cache = IFA->InstanceBaseCache;
+            for (UActorComponent* C : Collision)
+                if (Cache.GetInstanceBaseId(C) != FFoliageInstanceBaseCache::InvalidBaseId) { return EFoliageAttachment::Attached; }
+            for (const auto& Pair : Cache.InstanceBaseMap)
+                if (UActorComponent* Base = Pair.Value.BasePtr.Get(); Base && Collision.Contains(Base)) { return EFoliageAttachment::Attached; }
+            // 使用中のBaseId: 実instanceのBaseIdと、ComponentHashのkey。両者が一致していることも確かめる。
+            TSet<FFoliageInstanceBaseId> Used;
+            for (const auto& Info : IFA->GetFoliageInfos())
+            {
+                const FFoliageInfo& F = *Info.Value;
+                int32 Hashed = 0;
+                for (const auto& Hash : F.ComponentHash)
+                {
+                    Hashed += Hash.Value.Num();
+                    for (const int32 Index : Hash.Value)
+                        if (!F.Instances.IsValidIndex(Index) || F.Instances[Index].BaseId != Hash.Key) { bUnresolved = true; }
+                    if (Hash.Key != FFoliageInstanceBaseCache::InvalidBaseId && !Hash.Value.IsEmpty()) { Used.Add(Hash.Key); }
+                }
+                if (Hashed != F.Instances.Num()) { bUnresolved = true; }
+                for (int32 Index = 0; Index < F.Instances.Num(); ++Index)
+                {
+                    const FFoliageInstanceBaseId Id = F.Instances[Index].BaseId;
+                    const TSet<int32>* Set = F.ComponentHash.Find(Id);
+                    if (!Set || !Set->Contains(Index)) { bUnresolved = true; }
+                    if (Id != FFoliageInstanceBaseCache::InvalidBaseId) { Used.Add(Id); }
+                }
+            }
+            for (const FFoliageInstanceBaseId Id : Used)
+            {
+                const FFoliageInstanceBaseInfo* Entry = Cache.InstanceBaseMap.Find(Id);
+                UActorComponent* Base = Entry ? Entry->BasePtr.Get() : nullptr;   // Get()はロードしない
+                if (Base && Collision.Contains(Base)) { return EFoliageAttachment::Attached; }
+                if (!Base || !IsValid(Base) || !IsValid(Base->GetOwner())) { bUnresolved = true; }
+            }
+        }
+        return bUnresolved ? EFoliageAttachment::Unresolved : EFoliageAttachment::None;
+    }
     struct FTarget
     {
         ALandscape* Actor = nullptr;
@@ -78,7 +171,185 @@ namespace
         FVector Scale;
         FVector Origin;
     };
-    bool Resolve(const FString& Path, FTarget& T, FString& Error)
+    // Landscape Grassを使わないことを確かめられるか。GrassはUEが地形の変更後にTransactionの外で再生成するため、
+    // instance単位で保護も検証もできない。Grassの状態がある、またはmaterialの中身を確かめられない場合はfalse。
+    //
+    // materialとmaterial functionのgraphを最後まで自分で辿る。UEの列挙APIは解決できない参照を黙って飛ばすため、
+    // 「見つからなかった」を「Grassがない」の証明に使わない。親や関数の参照が解決できない、editor dataがない、
+    // 参照が循環する、上限を超える場合は判定不能とする。読み取りだけで、objectの変更・ロード・修復はしない。
+    struct FGrassGraphWalk
+    {
+        static constexpr int32 MaxDepth=64;          // 解析中の参照の深さ（material instanceの親とfunctionの呼び出し）
+        static constexpr int32 MaxObjects=4096;      // 解析するmaterial・functionの数（解析中と解析済みの合計。共有された参照は1回）
+        static constexpr int32 MaxExpressions=262144;
+        static constexpr int32 MaxEdges=2*MaxExpressions; // 参照を辿った回数（共有された参照への再訪を含む）
+        TSet<const UObject*> Done;                   // 解析が終わった参照先。共有された参照（DAG）は1回だけ辿る。
+        TArray<const UObject*,TInlineAllocator<16>> Active; // 解析中の参照の列。ここにある参照に戻ったら循環。
+        // graphの目印: 辿った参照先とexpressionを、辿った順に記録する（共有された参照への再訪も含む）。
+        // 同じpointerのmaterialにexpressionが足された、呼び出し先が変わった、などのin-placeの変更を、書き込みの前後で比べる。
+        // serializeはしない（親が循環するMaterial Instanceでは戻らない）。長さは上限で有界。
+        TArray<FObjectKey> Trace;
+        int32 Expressions=0;int32 Edges=0;bool bLayers=false;bool bInstance=false;FString Error;
+        bool Unknown(const TCHAR* Why,const UObject* O)
+        {
+            Error=FString::Printf(TEXT("The Landscape material cannot be inspected for Landscape Grass Output: %s (%s)."),Why,O?*O->GetPathName():TEXT("none"));
+            return false;
+        }
+        // 戻り値: false=拒否（Errorに理由）。bSkipは解析済みの参照。
+        bool Enter(const UObject* O,bool& bSkip)
+        {
+            if(++Edges>MaxEdges)return Unknown(TEXT("analysis limit exceeded"),O);
+            Trace.Add(FObjectKey(O));
+            bSkip=Done.Contains(O);if(bSkip)return true;
+            if(Active.Contains(O))return Unknown(TEXT("reference cycle"),O);
+            // DoneとActiveは重ならない（解析が終わるとActiveからDoneへ移る）ので、合計が解析するobjectの数。
+            if(Active.Num()>=MaxDepth||Done.Num()+Active.Num()>=MaxObjects)return Unknown(TEXT("analysis limit exceeded"),O);
+            Active.Add(O);return true;
+        }
+        bool Leave(const UObject* O,bool bOK){Active.Pop();if(bOK)Done.Add(O);return bOK;}
+        bool Material(const UMaterialInterface* M)
+        {
+            if(!M)return Unknown(TEXT("material is missing"),M);
+            bool bSkip=false;if(!Enter(M,bSkip))return false;if(bSkip)return true;
+            bool bOK=false;
+            if(const UMaterialInstance* I=Cast<UMaterialInstance>(M))
+            {bInstance=true;bOK=I->Parent?Material(I->Parent):Unknown(TEXT("material instance has no parent"),M);}
+            else if(const UMaterial* Base=Cast<UMaterial>(M))
+            {
+                const UMaterialInterface* Data=Base;   // CastCheckedを通らない基底のaccessorで、editor dataの有無を見る。
+                bOK=Cast<UMaterialEditorOnlyData>(Data->GetEditorOnlyData())?Graph(Base->GetExpressions(),M):Unknown(TEXT("material editor data is missing"),M);
+            }
+            else bOK=Unknown(TEXT("unsupported material class"),M);
+            return Leave(M,bOK);
+        }
+        bool Function(const UMaterialFunctionInterface* F)
+        {
+            bool bSkip=false;if(!Enter(F,bSkip))return false;if(bSkip)return true;
+            bool bOK=false;
+            if(const UMaterialFunctionInstance* I=Cast<UMaterialFunctionInstance>(F))
+            {bOK=I->Parent?Function(I->Parent):Unknown(TEXT("material function instance has no parent"),F);}
+            else if(const UMaterialFunction* Base=Cast<UMaterialFunction>(F))
+            {
+                // UMaterialFunction::GetEditorOnlyData()はnullを許さないCastCheckedなので、基底のaccessorを使う。
+                const UMaterialFunctionInterface* Data=Base;
+                bOK=Cast<UMaterialFunctionEditorOnlyData>(Data->GetEditorOnlyData())?Graph(Base->GetExpressions(),F):Unknown(TEXT("material function editor data is missing"),F);
+            }
+            else bOK=Unknown(TEXT("unsupported material function class"),F);
+            return Leave(F,bOK);
+        }
+        bool Graph(TConstArrayView<TObjectPtr<UMaterialExpression>> List,const UObject* Owner)
+        {
+            for(const UMaterialExpression* E:List)
+            {
+                if(!E)return Unknown(TEXT("expression is missing"),Owner);
+                if(++Expressions>MaxExpressions)return Unknown(TEXT("analysis limit exceeded"),Owner);
+                Trace.Add(FObjectKey(E));
+                if(E->IsA<UMaterialExpressionLandscapeGrassOutput>()){Error=TEXT("Landscape Grass Output is present.");return false;}
+                // 関数を指定していない呼び出しは解決できない参照。
+                if(const auto* Call=Cast<UMaterialExpressionMaterialFunctionCall>(E))
+                {
+                    if(!Call->MaterialFunction)return Unknown(TEXT("material function call has no function"),E);
+                    if(!Function(Call->MaterialFunction))return false;   // 自分自身の呼び出しも、解析中の参照として循環になる
+                }
+                if(const auto* Layers=Cast<UMaterialExpressionMaterialAttributeLayers>(E))
+                {
+                    // 空のlayer・blendのslotはUEで正当（既定の背景layerなど）なので拒否しない。設定されたものは辿る。
+                    bLayers=true;
+                    for(const UMaterialFunctionInterface* X:Layers->GetLayers())if(X&&!Function(X))return false;
+                    for(const UMaterialFunctionInterface* X:Layers->GetBlends())if(X&&!Function(X))return false;
+                }
+                // expressionが持つmaterial functionへの参照を、種類を問わずすべて辿る（未知のexpressionも見逃さない）。
+                // 所有元のfunctionへのback-pointer（UMaterialExpression::Function）は呼び出しではないので、propertyで除く
+                // （値で除くと、自分自身を呼ぶfunctionを見逃す）。
+                static const FProperty* const BackPointer=FindFProperty<FProperty>(UMaterialExpression::StaticClass(),GET_MEMBER_NAME_CHECKED(UMaterialExpression,Function));
+                for(TPropertyValueIterator<FObjectPropertyBase> It(E->GetClass(),E);It;++It)
+                {
+                    if(It->Key==BackPointer)continue;
+                    const UMaterialFunctionInterface* F=Cast<UMaterialFunctionInterface>(It->Key->GetObjectPropertyValue(It->Value));
+                    if(F&&!Function(F))return false;
+                }
+            }
+            return true;
+        }
+    };
+    // 判定に使ったmaterialの一覧とgraphの目印（書き込みの直前・直後とUndoの後に、同じ状態のままかを比べる）。
+    // FObjectKeyはpointerの再利用でも別のobjectと区別できる。
+    struct FGrassState
+    {
+        TArray<FObjectKey> Materials;
+        TArray<FObjectKey> Graph;
+        bool operator==(const FGrassState& O)const{return Materials==O.Materials&&Graph==O.Graph;}
+    };
+    // Grass instanceの状態（grass typeの上書き、生成済みのcomponent、生成中のtask、componentのgrass type）。
+    bool GrassInstancesAbsent(const ALandscape* A,FString& Error)
+    {
+        if(!A->GetGrassTypesOverrides().IsEmpty()||!A->FoliageComponents.IsEmpty()||!A->AsyncFoliageTasks.IsEmpty())
+        {Error=TEXT("Landscape Grass state is present (grass type overrides or grass instance components).");return false;}
+        for(const ULandscapeComponent* C:A->LandscapeComponents)
+        {
+            if(!C){Error=TEXT("Missing Landscape component.");return false;}
+            if(!C->GetNamedGrassTypes().IsEmpty()){Error=TEXT("Landscape component has grass types.");return false;}
+        }
+        return true;
+    }
+    bool GrassFree(const ALandscape* A,FString& Error,FGrassState* OutState=nullptr)
+    {
+        if(!GrassInstancesAbsent(A,Error))return false;
+        FGrassState State;FGrassGraphWalk Walk;
+        // bOptional: LODの上書きの空slotは正当（上書きなし）。Actor・componentのmaterialは必須（UEは未設定ならdefaultを返す）。
+        auto Visit=[&](const UMaterialInterface* M,bool bOptional){State.Materials.Add(FObjectKey(M));return (bOptional&&!M)||Walk.Material(M);};
+        bool bOK=Visit(A->GetLandscapeMaterial(),false);
+        for(const FLandscapePerLODMaterialOverride& O:A->GetPerLODOverrideMaterials())bOK=bOK&&Visit(O.Material,true);
+        for(const ULandscapeComponent* C:A->LandscapeComponents)
+        {
+            bOK=bOK&&Visit(C->GetLandscapeMaterial(),false);
+            for(const FLandscapePerLODMaterialOverride& O:C->GetPerLODOverrideMaterials())bOK=bOK&&Visit(O.Material,true);
+        }
+        if(!bOK){Error=Walk.Error;return false;}
+        // Material Instanceはmaterial layerの関数を差し替えられる。差し替え後の関数は確かめないため、layerを使う構成は判定不能とする。
+        if(Walk.bLayers&&Walk.bInstance)
+        {Error=TEXT("The Landscape material cannot be inspected for Landscape Grass Output: material layers of a Material Instance are not inspected.");return false;}
+        State.Graph=MoveTemp(Walk.Trace);
+        if(OutState)*OutState=MoveTemp(State);
+        return true;
+    }
+    // 円形ブラシのrollbackで、Undoがpackageのdirtyを元に戻したかを比べる対象（Actor、Info、component、heightmap）。
+    TArray<TPair<TWeakObjectPtr<UPackage>,bool>> PackageDirtyStates(const ALandscape* A,const ULandscapeInfo* Info)
+    {
+        TArray<TPair<TWeakObjectPtr<UPackage>,bool>> States;
+        auto Add=[&](const UObject* O)
+        {
+            UPackage* P=O?O->GetPackage():nullptr;
+            if(P&&!States.ContainsByPredicate([P](const auto& S){return S.Key.Get()==P;}))States.Emplace(P,P->IsDirty());
+        };
+        Add(A);Add(Info);
+        for(const ULandscapeComponent* C:A->LandscapeComponents){Add(C);if(C){Add(C->GetHeightmap(false));Add(C->GetHeightmap(true));}}
+        return States;
+    }
+    bool SameDirtyStates(const TArray<TPair<TWeakObjectPtr<UPackage>,bool>>& Before)
+    {
+        for(const auto& S:Before){const UPackage* P=S.Key.Get();if(!P||P->IsDirty()!=S.Value)return false;}
+        return true;
+    }
+    // 円形ブラシの書き込み後に復元を証明できなかった場合、このmodule sessionでは円形ブラシの書き込みを止める（v0.4のApplyと同じ方針）。
+    bool bBrushWritesDisabled=false;
+#if WITH_DEV_AUTOMATION_TESTS
+    bool bAutomationBrushRestoreFailure=false;
+    bool bAutomationBrushUnrelatedTransaction=false;
+#endif
+    bool BrushRestoreFault()
+    {
+#if WITH_DEV_AUTOMATION_TESTS
+        return GIsAutomationTesting&&bAutomationBrushRestoreFailure;
+#else
+        return false;
+#endif
+    }
+    // Read: Foliageが付いていても解決する（LandscapeもFoliageも変更しない用途）。
+    // Write: 付属Foliageを拒否する（事後検証のない円形ブラシの書き込み）。
+    // v0.4 Toolの書き込みはReadで解決し、Foliage gateで別に判定する。
+    enum class EResolveAccess { Read, Write };
+    bool Resolve(const FString& Path, FTarget& T, FString& Error, EResolveAccess Access = EResolveAccess::Write)
     {
         if (!EditorReady(Error)) { return false; }
         if (!Path.StartsWith(TEXT("/")) || !Path.Contains(TEXT(":PersistentLevel.")))
@@ -90,11 +361,16 @@ namespace
         if (!T.Actor || T.Actor->GetClass() != ALandscape::StaticClass())
         { Error = TEXT("Streaming proxies and Landscape subclasses are unsupported."); return false; }
         if (!LevelValid(T.Actor->GetLevel(), Error)) { return false; }
-        for (TActorIterator<ALandscapeProxy> It(T.Actor->GetWorld()); It; ++It)
+        int32 Unloaded = 0;
+        for (ALandscapeProxy* Other : LoadedProxies(T.Actor->GetWorld(), &Unloaded))
         {
-            if (*It != T.Actor && It->GetLandscapeGuid() == T.Actor->GetLandscapeGuid())
+            if (Other != T.Actor && Other->GetLandscapeGuid() == T.Actor->GetLandscapeGuid())
             { Error = TEXT("Landscape has another proxy; streaming landscapes are unsupported."); return false; }
         }
+        // 読み込まれていないLevelに同じLandscapeのproxyがあるかは分からない。書き込むと境界が合わなくなり得るため、
+        // 書き込み用途では拒否する（読み取りは対象自身のcomponentだけを読むので許可）。
+        if (Access == EResolveAccess::Write && Unloaded > 0)
+        { Error = TEXT("World has streaming levels that are not loaded; they may hold proxies of this Landscape, so writes are refused."); return false; }
         T.Scale = T.Actor->GetActorScale3D(); T.Origin = T.Actor->GetActorLocation();
         if (!VectorValid(T.Origin) || !T.Actor->GetActorQuat().Equals(FQuat::Identity, 1.e-8)
             || !VectorValid(T.Scale) || T.Scale.GetMin() < 1 || T.Scale.GetMax() > 1000)
@@ -117,13 +393,19 @@ namespace
         const int64 Height = int64(T.Extent.Max.Y) - T.Extent.Min.Y + 1;
         if (Width < 2 || Height < 2 || Width * Height > MaxCreateSamples)
         { Error = TEXT("Landscape exceeds the supported total sample limit."); return false; }
+        // 高さの変更で付属Foliageが移動・埋没し得るため、副作用で他のActorを変更しない。非表示・ロック中のLevelのIFAも見る。
+        if (Access == EResolveAccess::Write)
+        {
+            const EFoliageAttachment Attachment = TargetFoliageAttachment(T.Actor);
+            if (Attachment == EFoliageAttachment::Attached)
+            { Error = TEXT("Attached foliage is unsupported: editing could move other Actors."); return false; }
+            if (Attachment == EFoliageAttachment::Unresolved)
+            { Error = TEXT("Attached foliage cannot be ruled out: a foliage instance base is unresolved; editing could move other Actors."); return false; }
+        }
         for (ULandscapeComponent* C : T.Actor->LandscapeComponents)
         {
             if (!C || C->GetLandscapeProxy() != T.Actor || !C->GetLayerData(T.LayerGuid))
             { Error = TEXT("Missing or foreign component/layer data."); return false; }
-            // 高さの変更で付属Foliageが移動し得るため、副作用で他のActorを変更しない。
-            if (C->GetCollisionComponent() && AInstancedFoliageActor::HasFoliageAttached(C->GetCollisionComponent()))
-            { Error = TEXT("Attached foliage is unsupported: editing could move other Actors."); return false; }
             for (const FWeightmapLayerAllocationInfo& Allocation : C->GetWeightmapLayerAllocations(T.LayerGuid))
             {
                 if (Allocation.LayerInfo == ALandscapeProxy::VisibilityLayer)
@@ -160,10 +442,10 @@ namespace
                 // Package所有関係だけでは不十分なため、Landscape間のTexture共有を拒否する。
                 UTexture2D* FinalTexture = Component->GetHeightmap();
                 bool bShared = false;
-                for (TActorIterator<ALandscapeProxy> It(T.Actor->GetWorld()); It; ++It)
+                for (ALandscapeProxy* OtherProxy : LoadedProxies(T.Actor->GetWorld()))
                 {
-                    if (*It == T.Actor) { continue; }
-                    for (ULandscapeComponent* Other : It->LandscapeComponents)
+                    if (OtherProxy == T.Actor) { continue; }
+                    for (ULandscapeComponent* Other : OtherProxy->LandscapeComponents)
                     {
                         if (!Other) { continue; }
                         bShared |= Other->GetHeightmap() == Texture || Other->GetHeightmap() == FinalTexture;
@@ -304,7 +586,7 @@ bool Authoring::ReadSnapshot(const FString& Path,FVector2D Min,FVector2D Max,FHe
     if(!Coordinate(Min.X)||!Coordinate(Min.Y)||!Coordinate(Max.X)||!Coordinate(Max.Y)||Min.X>Max.X||Min.Y>Max.Y)
     {Code=TEXT("INVALID_COORDINATE");Error=Code;return false;}
     FTarget T;
-    if(!Resolve(Path,T,Error))
+    if(!Resolve(Path,T,Error,EResolveAccess::Read))
     {
         Code=Error.Contains(TEXT("foliage"))?TEXT("FOLIAGE_SAFETY_CONFLICT"):TEXT("UNSUPPORTED_LANDSCAPE_STATE");
         if(Error.Contains(TEXT("not found")))Code=TEXT("TARGET_NOT_FOUND");
@@ -328,11 +610,120 @@ bool Authoring::ReadSnapshot(const FString& Path,FVector2D Min,FVector2D Max,FHe
     Out.Origin=T.Origin;Out.Scale=T.Scale;Out.Extent=T.Extent;Out.Rect=Rect;Out.CachedSourceBytes=Reader.GetCachedBytes();return true;
 }
 
+// Worldに読み込まれているすべてのLevel（非表示・ロック中を含む）。TActorIterator<>の既定（OnlyActiveLevels）は
+// 非表示のLevelを飛ばすため使わない。Levelの読み込み・表示・ロック・保存の状態は変えない。
+// 読み込まれていないstreaming levelは中身を検査できないため、判定不能としてUnknownsへ入れる。
+void Authoring::LoadedLevels(UWorld* World,TArray<ULevel*>& Levels,TArray<FString>* Unknowns)
+{
+    Levels.Reset();if(!World)return;
+    for(ULevel* Level:World->GetLevels())if(IsValid(Level))Levels.AddUnique(Level);
+    for(ULevelStreaming* Streaming:World->GetStreamingLevels())
+    {
+        if(!Streaming)continue;
+        if(ULevel* Level=Streaming->GetLoadedLevel()){if(IsValid(Level))Levels.AddUnique(Level);continue;}
+        if(Unknowns)Unknowns->Add(TEXT("LEVEL_NOT_LOADED: ")+Streaming->GetWorldAssetPackageName()+TEXT(" is not loaded; its foliage cannot be inspected."));
+    }
+}
+
+// 読み取りのみ。IFAのinstance配列・hash・base cacheをconstで参照し、Modify・登録・再構築を行わない。
+bool Authoring::CollectFoliage(const FString& Path,FVector2D Min,FVector2D Max,Foliage::FInventory& Out,FString& Code,FString& Error)
+{
+    Out={};
+    if(!Coordinate(Min.X)||!Coordinate(Min.Y)||!Coordinate(Max.X)||!Coordinate(Max.Y)||Min.X>Max.X||Min.Y>Max.Y)
+    {Code=TEXT("INVALID_COORDINATE");Error=Code;return false;}
+    FTarget T;
+    if(!Resolve(Path,T,Error,EResolveAccess::Read))
+    {
+        Code=TEXT("UNSUPPORTED_LANDSCAPE_STATE");
+        if(Error.Contains(TEXT("not found")))Code=TEXT("TARGET_NOT_FOUND");
+        if(Error.Contains(TEXT("exact loaded")))Code=TEXT("INVALID_TARGET_PATH");
+        return false;
+    }
+    const ULandscapeSettings* Settings=GetDefault<ULandscapeSettings>();
+    const EFoliageLandscapeSnappingMode Mode=Settings?Settings->GetFoliageLandscapeSnappingMode():EFoliageLandscapeSnappingMode::SnapEverywhere;
+    Out.SnappingMode=Mode==EFoliageLandscapeSnappingMode::DontSnap?TEXT("DontSnap"):Mode==EFoliageLandscapeSnappingMode::SnapUnderBrushOnly?TEXT("SnapUnderBrushOnly"):TEXT("SnapEverywhere");
+    // SnapUnderBrushOnlyは、ユーザーの以前のbrush操作で付いた未処理の印によって追従し得るため安全側に倒す。
+    Out.bSnappingSafe=Settings&&Mode==EFoliageLandscapeSnappingMode::DontSnap;
+    TArray<UActorComponent*> TargetCollision;
+    for(ULandscapeComponent* C:T.Actor->LandscapeComponents)
+        if(ULandscapeHeightfieldCollisionComponent* Collision=C->GetCollisionComponent())TargetCollision.Add(Collision);
+    // 付属の有無は、円形ブラシの拒否と同じ判定（全Level、付属先を証明できない場合も付属とみなす）。
+    TArray<ULevel*> Levels;LoadedLevels(T.Actor->GetWorld(),Levels,&Out.Unknowns);
+    const TArray<AInstancedFoliageActor*> Foliage=LoadedFoliageActors(T.Actor->GetWorld());
+    Out.bTargetHasAttachedFoliage=TargetFoliageAttachment(T.Actor)!=EFoliageAttachment::None;
+    TArray<AActor*> Procedural;
+    for(ULevel* Level:Levels)
+        for(AActor* Actor:Level->Actors)
+            if(IsValid(Actor)&&!Actor->IsA<AInstancedFoliageActor>()&&Actor->FindComponentByClass<UProceduralFoliageComponent>())Procedural.Add(Actor);
+    // Grassはinstance単位で追えないため、範囲に関わらず判定不能とする。
+    bool bGrass=!T.Actor->FoliageComponents.IsEmpty()||!T.Actor->AsyncFoliageTasks.IsEmpty()||!T.Actor->GetGrassTypesOverrides().IsEmpty();
+    UMaterial* Default=UMaterial::GetDefaultMaterial(MD_Surface);
+    bool bCustomMaterial=T.Actor->GetLandscapeMaterial()!=Default;
+    for(ULandscapeComponent* C:T.Actor->LandscapeComponents)
+    {bGrass|=!C->GetNamedGrassTypes().IsEmpty();bCustomMaterial|=C->GetLandscapeMaterial()!=Default;}
+    if(bGrass)Out.Unknowns.Add(TEXT("LANDSCAPE_GRASS: grass instances are regenerated and cannot be verified per instance."));
+    if(bCustomMaterial)Out.Unknowns.Add(TEXT("LANDSCAPE_MATERIAL_NOT_INSPECTED: grass output of a non-default Landscape material is not inspected."));
+    const FBox Box(FVector(Min.X,Min.Y,-MaxCoordinate),FVector(Max.X,Max.Y,MaxCoordinate));
+    for(AActor* Actor:Procedural)
+    {
+        const FBox Bounds=Actor->GetComponentsBoundingBox(true);
+        if(!Bounds.IsValid||(Bounds.Min.X<=Max.X&&Bounds.Max.X>=Min.X&&Bounds.Min.Y<=Max.Y&&Bounds.Max.Y>=Min.Y))
+            Out.Unknowns.Add(TEXT("PROCEDURAL_FOLIAGE: ")+Actor->GetPathName());
+    }
+    for(const AInstancedFoliageActor* IFA:Foliage)
+    {
+        const bool bOtherLevel=IFA->GetLevel()!=T.Actor->GetLevel();
+        TSet<FFoliageInstanceBaseId> TargetIds;
+        for(UActorComponent* Collision:TargetCollision)
+        {
+            const FFoliageInstanceBaseId Id=IFA->InstanceBaseCache.GetInstanceBaseId(Collision);
+            if(Id!=FFoliageInstanceBaseCache::InvalidBaseId)TargetIds.Add(Id);
+        }
+        for(const auto& Pair:IFA->GetFoliageInfos())
+        {
+            const UFoliageType* Type=Pair.Key;const FFoliageInfo& Info=*Pair.Value;
+            if(Info.Instances.IsEmpty())continue;
+            TArray<int32> Candidates;
+            if(Info.InstanceHash.IsValid())Candidates=Info.GetInstancesOverlappingBox(Box);
+            else for(int32 Index=0;Index<Info.Instances.Num();++Index)Candidates.Add(Index);
+            Candidates.Sort();
+            const UFoliageType_InstancedStaticMesh* Mesh=Cast<UFoliageType_InstancedStaticMesh>(Type);
+            for(int32 Index:Candidates)
+            {
+                if(!Info.Instances.IsValidIndex(Index))continue;
+                if(++Out.ScannedCount>Foliage::MaxScannedInstances){Out.bScanLimitExceeded=true;Out.Samples.Reset();return true;}
+                const FFoliageInstance& Instance=Info.Instances[Index];
+                if(Instance.Location.X<Min.X||Instance.Location.X>Max.X||Instance.Location.Y<Min.Y||Instance.Location.Y>Max.Y)continue;
+                Foliage::FSample S;
+                S.FoliageType=GetPathNameSafe(Type);S.Mesh=Mesh?GetPathNameSafe(Mesh->GetStaticMesh()):FString();
+                S.Location=Instance.Location;S.Rotation=Instance.Rotation;S.Scale=FVector(Instance.DrawScale3D);
+                S.ZOffsetCm=Instance.ZOffset;S.Flags=Instance.Flags;
+                S.Base=TargetIds.Contains(Instance.BaseId)?Foliage::EBase::TargetLandscape
+                    :Instance.BaseId==FFoliageInstanceBaseCache::InvalidBaseId?Foliage::EBase::Unattached:Foliage::EBase::OtherComponent;
+                if(bOtherLevel)S.UnknownReason=TEXT("FOLIAGE_IN_OTHER_LEVEL");
+                else if(Info.Type!=EFoliageImplType::StaticMesh||!Mesh)S.UnknownReason=TEXT("NON_STATIC_MESH_FOLIAGE");
+                else if(Instance.ProceduralGuid.IsValid())S.UnknownReason=TEXT("PROCEDURAL_INSTANCE");
+                Out.Samples.Add(MoveTemp(S));
+            }
+        }
+    }
+    Out.Unknowns.Sort();
+    // IFAとFoliageInfoの列挙順に依存しない比較のため、内容で並べる。
+    Out.Samples.Sort([](const Foliage::FSample& A,const Foliage::FSample& B)
+    {
+        if(A.FoliageType!=B.FoliageType)return A.FoliageType<B.FoliageType;
+        if(A.Location.X!=B.Location.X)return A.Location.X<B.Location.X;
+        if(A.Location.Y!=B.Location.Y)return A.Location.Y<B.Location.Y;
+        return A.Location.Z<B.Location.Z;
+    });
+    return true;
+}
+
 FLandscapeMCPResult Height(const FString& Path, double X, double Y)
 {
     if (!Coordinate(X) || !Coordinate(Y)) { return Fail(TEXT("Non-finite / out-of-range world XY."),Path); }
     FTarget T; FString Error;
-    if (!Resolve(Path,T,Error)) { return Fail(Error,Path); }
+    if (!Resolve(Path,T,Error,EResolveAccess::Read)) { return Fail(Error,Path); }
     const FVector2D Local((X-T.Origin.X)/T.Scale.X,(Y-T.Origin.Y)/T.Scale.Y);
     if (!Contains(T.Extent,Local)) { return Fail(TEXT("Query point is outside Landscape."),Path); }
     const int32 X0 = FMath::FloorToInt(Local.X), Y0 = FMath::FloorToInt(Local.Y);
@@ -423,29 +814,94 @@ FLandscapeMCPResult Edit(const FEditRequest& R)
     Result.WorldMax = FVector(T.Origin.X+Rect.Max.X*T.Scale.X,T.Origin.Y+Rect.Max.Y*T.Scale.Y,MaxZ);
     Result.Message = TEXT("Validated complete edit; deltas include heightfield quantization; nothing saved.");
     if (R.bDryRun || Result.ChangedSampleCount == 0) { return Result; }
-    if (GEditor->IsTransactionActive()) { return Fail(TEXT("Nested write transactions are unsupported."),R.LandscapePath); }
+    if (bBrushWritesDisabled)
+    { return Fail(TEXT("BRUSH_WRITES_DISABLED: A previous brush edit could not be proven restored; restart the Editor or reload the module after investigating."),R.LandscapePath); }
+    // Dry-runはv0.4の3 Toolと同じくGrassを検査しない。書き込む場合だけ拒否する。判定した状態を記録し、書き込みの直前・直後に比べる。
+    FGrassState GrassBefore;
+    if (!GrassFree(T.Actor,Error,&GrassBefore)) { return Fail(TEXT("UNSUPPORTED_GRASS_STATE: ")+Error,R.LandscapePath); }
+    if (GEditor->IsTransactionActive() || !GEditor->Trans) { return Fail(TEXT("Nested write transactions are unsupported."),R.LandscapePath); }
+    const FString OwnedContext = TEXT("LandscapeMCP.Brush.")+FGuid::NewGuid().ToString();
+    FGuid Owned;
+    // rollbackで照合する、書き込み前のUndo履歴とpackageのdirty。
+    const FGuid UndoBefore = GEditor->Trans->GetUndoContext(false).TransactionId;
+    const int32 ActiveUndoBefore = GEditor->Trans->GetQueueLength()-GEditor->Trans->GetUndoCount();
+    const TArray<TPair<TWeakObjectPtr<UPackage>,bool>> DirtyBefore = PackageDirtyStates(T.Actor,T.Info);
     {
-        FScopedTransaction Transaction(INVTEXT("Landscape MCP Heightfield Edit"));
-        T.Actor->Modify(); T.Info->Modify();
+        FScopedTransaction Transaction(*OwnedContext,INVTEXT("Landscape MCP Heightfield Edit"),T.Actor);
+        if (GUndo) { Owned = GUndo->GetContext().TransactionId; }
+        // Modify()はOnObjectModifiedを、MarkPackageDirty()はPackageMarkedDirtyEventを同期で通知し、Editor拡張のlistenerが
+        // materialやGrassの状態を変え得る。Modifyは汚れ印なしで先に済ませ、最後の再検証からSetHeightDataまでの間には
+        // 通知を出す処理を置かない。汚れ印は書き込みの後に付ける（そこでの通知は書き込み後の検証で扱う）。
+        T.Actor->Modify(false); T.Info->Modify(false);
         {
             FScopedSetLandscapeEditingLayer LayerScope(T.Actor,T.LayerGuid);
             FLandscapeEditDataInterface EditData(T.Info,T.LayerGuid);
+            FGrassState GrassNow; Error.Reset();
+            if (!Owned.IsValid() || !GrassFree(T.Actor,Error,&GrassNow) || !(GrassNow == GrassBefore))
+            {
+                // 自分ではまだ何も変えていない（汚れ印も付けていない）。Cancelは記録を捨てるだけで、listenerが行った変更は戻さない（このToolの変更ではない）。
+                Transaction.Cancel();
+                return Fail(TEXT("UNSUPPORTED_GRASS_STATE: Landscape Grass state changed while preparing the write; nothing was written. ")
+                    +(Owned.IsValid() ? (Error.IsEmpty() ? FString(TEXT("The Landscape material or its graph changed.")) : Error) : FString(TEXT("Could not start an owned transaction."))),R.LandscapePath);
+            }
             EditData.SetHeightData(Rect.Min.X,Rect.Min.Y,Rect.Max.X,Rect.Max.Y,Output.GetData(),0,false,
                 nullptr,nullptr,nullptr,false,nullptr,nullptr,true,true,true);
             EditData.Flush();
         }
+        T.Actor->MarkPackageDirty(); T.Info->MarkPackageDirty();
         T.Actor->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_Heightmap_All);
         T.Actor->ForceUpdateLayersContent();
     }
+    // 書き込み中・書き込み後（SetHeightData、汚れ印、更新処理の中の通知）に状態が変わった場合も成功を返さない。
     FSourceReader Verify(T); TArray<uint16> Actual;
-    if (!Verify.Region(Rect,Actual,Error) || Actual != Output)
+    const bool bSourceOK = Verify.Region(Rect,Actual,Error) && Actual == Output;
+    FString GrassError; FGrassState GrassAfter;
+    const bool bGrassOK = GrassFree(T.Actor,GrassError,&GrassAfter) && GrassAfter == GrassBefore;
+    if (!bSourceOK || !bGrassOK)
     {
-        const bool bUndone = GEditor->UndoTransaction(false);
-        return Fail(FString(TEXT("Source verification failed; rollback ")) + (bUndone ? TEXT("completed.") : TEXT("FAILED; stop editing.")),R.LandscapePath);
+#if WITH_DEV_AUTOMATION_TESTS
+        if (GIsAutomationTesting && bAutomationBrushUnrelatedTransaction)
+        {FScopedTransaction Other(TEXT("LandscapeMCP.Automation.Unrelated"),INVTEXT("Unrelated Automation transaction"),T.Actor);T.Actor->Modify();T.Actor->SetActorLabel(TEXT("Automation unrelated label edit"));}
+#endif
+        // 所有するtransactionが最新である場合だけUndoする（他者のtransactionはUndoしない）。
+        // Undoの後に、高さ、material・graph・Grass、Undo履歴、packageのdirtyがすべて書き込み前と同じことを確かめる。
+        // Undoが戻すのはtransactionに記録されたobjectだけなので、Undoが成功しただけでは復元できたとみなさない。
+        // listenerがtransactionの外で加えた変更（materialのgraphなど）は、このToolでは書き戻さず、復元できなかったとして止める。
+        const FTransactionContext Latest = GEditor->Trans->GetUndoContext();
+        const bool bOwn = Owned.IsValid() && !GEditor->IsTransactionActive() && Latest.TransactionId == Owned
+            && Latest.Context == OwnedContext && Latest.PrimaryObject == T.Actor;
+        bool bRestored = false; FString RestoreError;
+        if (!bOwn) { RestoreError = TEXT("Ownership of the latest transaction could not be proved; no Undo was attempted."); }
+        // bCanRedo=false: Undoした自分のtransactionはbufferから外れ、拒否した書き込みをRedoで再現できない。
+        else if (!GEditor->UndoTransaction(false)) { RestoreError = TEXT("Undo of the owned transaction failed."); }
+        else
+        {
+            T.Actor->ForceUpdateLayersContent();
+            FSourceReader Back(T); TArray<uint16> Now; FGrassState GrassRestored; FString ReadError;
+            if (!Back.Region(ReadRect,Now,ReadError) || Now != Original) { RestoreError = TEXT("The heights differ from the original after Undo. ")+ReadError; }
+            else if (!GrassFree(T.Actor,RestoreError,&GrassRestored)) { RestoreError = TEXT("After Undo: ")+RestoreError; }
+            else if (!(GrassRestored == GrassBefore)) { RestoreError = TEXT("After Undo, the Landscape material or its graph differs from the original (a change outside the owned transaction is not reverted by Undo)."); }
+            else if (GEditor->Trans->GetUndoContext(false).TransactionId != UndoBefore || GEditor->Trans->FindTransactionIndex(Owned) != INDEX_NONE
+                || GEditor->Trans->GetQueueLength()-GEditor->Trans->GetUndoCount() != ActiveUndoBefore)
+            { RestoreError = TEXT("The undo history differs from the original after Undo."); }
+            else if (!SameDirtyStates(DirtyBefore)) { RestoreError = TEXT("A package dirty state differs from the original after Undo."); }
+            else if (BrushRestoreFault()) { RestoreError = TEXT("Automation fault: restoration treated as not provable."); }
+            else { bRestored = true; }
+        }
+        if (!bRestored) { bBrushWritesDisabled = true; }
+        const FString Rollback = bRestored ? FString(TEXT("rollback completed."))
+            : FString(TEXT("rollback FAILED; brush writes are disabled for this module session; stop editing. "))+RestoreError;
+        if (!bSourceOK) { return Fail(TEXT("Source verification failed; ")+Rollback,R.LandscapePath); }
+        return Fail(TEXT("UNSUPPORTED_GRASS_STATE: Landscape Grass state changed during the write; ")
+            +(GrassError.IsEmpty() ? FString(TEXT("The Landscape material or its graph changed.")) : GrassError)+TEXT(" ")+Rollback,R.LandscapePath);
     }
     Result.Message = TEXT("Source heightfield verified after edit; layer/collision update requested; Undo available; nothing saved.");
     return Result;
 }
+#if WITH_DEV_AUTOMATION_TESTS
+void SetAutomationBrushRestoreFailure(bool bFail){check(GIsAutomationTesting);bAutomationBrushRestoreFailure=bFail;}
+void SetAutomationBrushUnrelatedTransaction(bool bInsert){check(GIsAutomationTesting);bAutomationBrushUnrelatedTransaction=bInsert;}
+#endif
 
 namespace
 {
@@ -507,7 +963,7 @@ namespace
     {
         if (!SlopeInputValid(X,Y,D,Error)) { return false; }
         FTarget T;
-        if (!Resolve(Path,T,Error)) { return false; }
+        if (!Resolve(Path,T,Error,EResolveAccess::Read)) { return false; }
         FSourceReader Reader(T);
         return MeasureSlopeAt(T,Reader,X,Y,D,Out,Error);
     }
@@ -596,7 +1052,7 @@ FLandscapeMCPHeightRegionResult HeightRegion(const FString& Path, double MinX, d
     if (CountX > MaxRegionSamples || CountY > MaxRegionSamples || CountX*CountY > MaxRegionSamples)
     { R.Message = TEXT("Region exceeds 1024 samples; increase SampleSpacingCm or split the region."); return R; }
     FTarget T; FString Error;
-    if (!Resolve(Path,T,Error)) { R.Message = Error; return R; }
+    if (!Resolve(Path,T,Error,EResolveAccess::Read)) { R.Message = Error; return R; }
     const FVector2D LocalMin((MinX-T.Origin.X)/T.Scale.X,(MinY-T.Origin.Y)/T.Scale.Y);
     const FVector2D LocalMax((MaxX-T.Origin.X)/T.Scale.X,(MaxY-T.Origin.Y)/T.Scale.Y);
     if (!Contains(T.Extent,LocalMin) || !Contains(T.Extent,LocalMax))
@@ -661,7 +1117,7 @@ FLandscapeMCPSlopeNeighborhoodResult SlopeNeighborhood(const FString& Path, doub
     if (!FMath::IsFinite(RadiusCm) || RadiusCm <= 0 || RadiusCm > MaxRadius)
     { R.Message = TEXT("RadiusCm must be finite and within (0,5000]."); return R; }
     FTarget T;
-    if (!Resolve(Path,T,Error)) { R.Message = Error; return R; }
+    if (!Resolve(Path,T,Error,EResolveAccess::Read)) { R.Message = Error; return R; }
     FSourceReader Reader(T); FSlopeMeasurement M;
     // 中心傾斜はGetSlopeと同じ経路で測る。端で4点が揃わない場合は全体を拒否する。
     if (!MeasureSlopeAt(T,Reader,X,Y,SampleDistanceCm,M,Error)) { R.Message = Error; return R; }
@@ -708,7 +1164,7 @@ FLandscapeMCPWalkabilityRegionResult WalkabilityRegion(const FString& Path, doub
     if (!FMath::IsFinite(WalkableFloorAngleDeg) || WalkableFloorAngleDeg < 0 || WalkableFloorAngleDeg > 90)
     { R.Message = TEXT("WalkableFloorAngleDeg must be finite and within [0,90]."); return R; }
     FTarget T; FString Error;
-    if (!Resolve(Path,T,Error)) { R.Message = Error; return R; }
+    if (!Resolve(Path,T,Error,EResolveAccess::Read)) { R.Message = Error; return R; }
     const FVector2D LocalMin((MinX-T.Origin.X)/T.Scale.X,(MinY-T.Origin.Y)/T.Scale.Y);
     const FVector2D LocalMax((MaxX-T.Origin.X)/T.Scale.X,(MaxY-T.Origin.Y)/T.Scale.Y);
     if (!Contains(T.Extent,LocalMin) || !Contains(T.Extent,LocalMax))
@@ -736,6 +1192,66 @@ FLandscapeMCPWalkabilityRegionResult WalkabilityRegion(const FString& Path, doub
     R.Message = TEXT("Read-only geometry evaluation of the Landscape triangles (diagonal 00-11) against the caller-supplied angle; CharacterMovement is not consulted. No package or transaction changes.");
     return R;
 }
+
+FLandscapeMCPFoliageInspectResult FoliageInspect(const FString& Path, double MinX, double MinY, double MaxX, double MaxY, int32 MaxInstances)
+{
+    FLandscapeMCPFoliageInspectResult R; R.LandscapePath = Path;
+    if (!Coordinate(MinX) || !Coordinate(MinY) || !Coordinate(MaxX) || !Coordinate(MaxY))
+    { R.Message = TEXT("Non-finite / out-of-range region bounds."); return R; }
+    if (MaxX < MinX || MaxY < MinY) { R.Message = TEXT("Reversed region bounds: max must be >= min."); return R; }
+    if (MaxInstances < 0 || MaxInstances > 4096) { R.Message = TEXT("MaxInstances must be within [0,4096]."); return R; }
+    FTarget T; FString Error, Code;
+    if (!Resolve(Path,T,Error,EResolveAccess::Read)) { R.Message = Error; return R; }
+    const FVector2D LocalMin((MinX-T.Origin.X)/T.Scale.X,(MinY-T.Origin.Y)/T.Scale.Y);
+    const FVector2D LocalMax((MaxX-T.Origin.X)/T.Scale.X,(MaxY-T.Origin.Y)/T.Scale.Y);
+    if (!Contains(T.Extent,LocalMin) || !Contains(T.Extent,LocalMax))
+    { R.Message = TEXT("Region is not fully inside Landscape; it is not clipped."); return R; }
+    Engine::ITerrainEngineAdapter& Adapter = Engine::GetActiveAdapter();
+    Authoring::FHeightfieldSnapshot Snapshot;
+    if (!Adapter.ReadHeights(Path,FVector2D(MinX,MinY),FVector2D(MaxX,MaxY),Snapshot,Code,Error)) { R.Message = Code + TEXT(": ") + Error; return R; }
+    Foliage::FInventory Inventory;
+    if (!Adapter.InspectFoliage(Path,FVector2D(MinX,MinY),FVector2D(MaxX,MaxY),Inventory,Code,Error)) { R.Message = Code + TEXT(": ") + Error; return R; }
+    R.bSuccess = true;
+    R.SnappingMode = Inventory.SnappingMode; R.bTargetHasAttachedFoliage = Inventory.bTargetHasAttachedFoliage;
+    R.ScannedInstanceCount = Inventory.ScannedCount; R.Unknowns = Inventory.Unknowns;
+    R.bScanLimitExceeded = Inventory.bScanLimitExceeded;
+    if (Inventory.bScanLimitExceeded)
+    {
+        // 件数は分からない。0件と誤読されないよう -1 を返し、ScannedInstanceCountは実数の下限（上限 + 1）を表す。
+        R.Unknowns.Add(FString::Printf(TEXT("SCAN_LIMIT_EXCEEDED: more than %d foliage instances overlap the region; counts and the instance list are not available."),Foliage::MaxScannedInstances));
+        R.bInstanceCountExact = false; R.InstanceCount = -1; R.Status = TEXT("UNKNOWN_PRESENT");
+        R.Message = TEXT("Read-only: the region holds more foliage candidates than the scan limit; nothing was classified. No Landscape, foliage, package or transaction changes.");
+        return R;
+    }
+    bool bUnknownInstance = false;
+    for (const Foliage::FSample& S : Inventory.Samples)
+    {
+        ++R.InstanceCount;
+        FLandscapeMCPFoliageTypeSummary* Summary = R.Types.FindByPredicate([&](const FLandscapeMCPFoliageTypeSummary& V) { return V.FoliageType == S.FoliageType; });
+        if (!Summary) { Summary = &R.Types.AddDefaulted_GetRef(); Summary->FoliageType = S.FoliageType; Summary->Mesh = S.Mesh; }
+        ++Summary->Count;
+        if (!S.UnknownReason.IsEmpty()) { ++Summary->UnknownCount; bUnknownInstance = true; }
+        if (S.Base == Foliage::EBase::TargetLandscape) { ++Summary->TargetLandscapeCount; }
+        else if (S.Base == Foliage::EBase::OtherComponent) { ++Summary->OtherComponentCount; }
+        else { ++Summary->UnattachedCount; }
+        if (R.Instances.Num() >= MaxInstances) { R.bTruncated = true; continue; }
+        FLandscapeMCPFoliageInstanceInfo& Info = R.Instances.AddDefaulted_GetRef();
+        Info.FoliageType = S.FoliageType; Info.Location = S.Location; Info.Rotation = S.Rotation; Info.Scale = S.Scale;
+        Info.ZOffsetCm = S.ZOffsetCm; Info.Base = Foliage::ToString(S.Base); Info.UnknownReason = S.UnknownReason;
+        double Terrain = 0, Slope = 0;
+        if (Foliage::TerrainAt(Snapshot,Snapshot.Heights,FVector2D(S.Location.X,S.Location.Y),Terrain,Slope))
+        { Info.TerrainHeightCm = Terrain; Info.HeightAboveTerrainCm = S.Location.Z - Terrain; Info.LocalSlopeDegrees = Slope; }
+        else if (Info.UnknownReason.IsEmpty()) { Info.UnknownReason = TEXT("TERRAIN_NOT_READABLE"); bUnknownInstance = true; }
+    }
+    R.Status = (!R.Unknowns.IsEmpty() || bUnknownInstance) ? TEXT("UNKNOWN_PRESENT") : R.InstanceCount == 0 ? TEXT("NO_FOLIAGE") : TEXT("INSPECTED");
+    R.Message = TEXT("Read-only: foliage instances whose location lies in the region, with the terrain under each. No Landscape, foliage, package or transaction changes.");
+    return R;
+}
+
+FLandscapeMCPCapabilitiesResult Capabilities()
+{
+    return Engine::GetActiveAdapter().Capabilities();
+}
 }
 
 namespace LandscapeMCP::Authoring
@@ -749,7 +1265,8 @@ namespace
     bool Fault(EApplyFault F){return GIsAutomationTesting&&AutomationFault==F;}
 #else
     enum class EApplyFault { None,SourceMismatch,FreshReadFailure,GeometryMismatch,CollisionFailure,UndoFalse,RestoreMismatch,
-        RestoreCollisionFailure,OwnershipMismatch,InsertUnrelatedTransaction,StaleSource,RestoreCodecMismatch,RestoreCollisionStale };
+        RestoreCollisionFailure,OwnershipMismatch,InsertUnrelatedTransaction,StaleSource,RestoreCodecMismatch,RestoreCollisionStale,
+        FoliageStaleSnapMode,FoliageStaleUnknown,FoliageChangeInTransaction,FoliageChangeOutsideTransaction };
     bool Fault(EApplyFault){return false;}
 #endif
     struct FIdentity
@@ -791,26 +1308,22 @@ namespace
         while(RetryRecords.Num()>=MaxRetryRecords)RetryRecords.RemoveAt(0);
         RetryRecords.Add(MoveTemp(Record));
     }
-    bool GrassSafe(const FTarget& T,FString& Error)
+    bool GrassSafe(const FTarget& T,FString& Error,FGrassState* OutState=nullptr)
     {
         // Deliberately narrow allowlist. Material Instances, custom materials,
         // LOD overrides and grass caches are refused, including unknown graphs.
         UMaterial* Default=UMaterial::GetDefaultMaterial(MD_Surface);
-        if(!Default||!Default->GetEditorOnlyData()||T.Actor->GetLandscapeMaterial()!=Default
-            ||!T.Actor->GetPerLODOverrideMaterials().IsEmpty()||!T.Actor->GetGrassTypesOverrides().IsEmpty()
-            ||!T.Actor->FoliageComponents.IsEmpty()||!T.Actor->AsyncFoliageTasks.IsEmpty())
+        if(!Default||T.Actor->GetLandscapeMaterial()!=Default||!T.Actor->GetPerLODOverrideMaterials().IsEmpty())
         {Error=TEXT("Only the inspectable engine default material without grass state is supported for Apply.");return false;}
-        TArray<UMaterialExpressionLandscapeGrassOutput*> Grass;
-        Default->GetAllExpressionsInMaterialAndFunctionsOfType(Grass);
-        if(!Grass.IsEmpty()){Error=TEXT("Landscape Grass Output is present.");return false;}
         for(ULandscapeComponent* C:T.Actor->LandscapeComponents)
-            if(C->GetLandscapeMaterial()!=Default||!C->GetPerLODOverrideMaterials().IsEmpty()||!C->GetNamedGrassTypes().IsEmpty())
+            if(C->GetLandscapeMaterial()!=Default||!C->GetPerLODOverrideMaterials().IsEmpty())
             {Error=TEXT("Component material override or grass state is unsupported.");return false;}
-        return true;
+        // Grassの状態の判定は円形ブラシと共通。
+        return GrassFree(T.Actor,Error,OutState);
     }
     bool CaptureTarget(const FString& Path,FTarget& T,FIdentity& I,FString& Code,FString& Error)
     {
-        I={};if(!Resolve(Path,T,Error)){Code=Error.Contains(TEXT("foliage"))?TEXT("FOLIAGE_SAFETY_CONFLICT"):TEXT("UNSUPPORTED_LANDSCAPE_STATE");return false;}
+        I={};if(!Resolve(Path,T,Error,EResolveAccess::Read)){Code=Error.Contains(TEXT("foliage"))?TEXT("FOLIAGE_SAFETY_CONFLICT"):TEXT("UNSUPPORTED_LANDSCAPE_STATE");return false;}
         if(!GEditor->Trans||GEditor->IsTransactionActive()||GIsTransacting){Code=TEXT("ACTIVE_TRANSACTION");Error=TEXT("An idle Editor transaction buffer is required.");return false;}
         const auto* SavePolicy=GetDefault<UEditorLoadingSavingSettings>();
         if(!SavePolicy||SavePolicy->bAutoSaveEnable||SavePolicy->GetAutomaticallyCheckoutOnAssetModification()
@@ -865,6 +1378,21 @@ namespace
                 Out.Objects.Add(W);Out.Paths.Add(W->GetPathName());Out.Hashes.Add(FCrc::MemCrc32(Bytes.GetData(),int32(Bytes.Num())));
             }
         }
+        return true;
+    }
+    // collateralのうちFoliage Actor（全Levelの全IFA）のbyte CRCが同じか。読み取り範囲の外で動いたinstanceも検出する。
+    TMap<FString,uint32> FoliageActorHashes(const FCollateral& C)
+    {
+        TMap<FString,uint32> Out;
+        for(int32 I=0;I<C.Objects.Num();++I)
+            if(const UObject* O=C.Objects[I].Get();O&&O->IsA<AInstancedFoliageActor>())Out.Add(C.Paths[I],C.Hashes[I]);
+        return Out;
+    }
+    bool SameFoliageActors(const FCollateral& A,const FCollateral& B)
+    {
+        const TMap<FString,uint32> X=FoliageActorHashes(A),Y=FoliageActorHashes(B);
+        if(X.Num()!=Y.Num())return false;
+        for(const auto& Pair:X){const uint32* Other=Y.Find(Pair.Key);if(!Other||*Other!=Pair.Value)return false;}
         return true;
     }
     bool SameSnapshot(const FHeightfieldSnapshot& A,const FHeightfieldSnapshot& B)
@@ -987,13 +1515,70 @@ namespace
         O.ActualAfter={};O.TransitionActualAfter={};
         O.Status=TEXT("REJECTED");O.Message=FString(Stage)+TEXT(": ")+Reason;return O;
     }
+    // Foliageは計画の読み取り範囲（affectedBoundsと1セルのhalo）で評価する。範囲外のinstanceは高さが変わらない。
+    void ReadBounds(const FHeightfieldSnapshot& S,FVector2D& Min,FVector2D& Max)
+    {
+        Min=FVector2D(S.Origin.X+S.Rect.Min.X*S.Scale.X,S.Origin.Y+S.Rect.Min.Y*S.Scale.Y);
+        Max=FVector2D(S.Origin.X+S.Rect.Max.X*S.Scale.X,S.Origin.Y+S.Rect.Max.Y*S.Scale.Y);
+    }
+    bool InspectFoliageIn(const FString& Path,const FHeightfieldSnapshot& S,Foliage::FInventory& Out,FString& Error)
+    {
+        FVector2D Min,Max;ReadBounds(S,Min,Max);FString Code;
+        if(Engine::GetActiveAdapter().InspectFoliage(Path,Min,Max,Out,Code,Error))return true;
+        Error=Code+TEXT(" ")+Error;return false;
+    }
+    // 収集に失敗した場合も安全とはみなさず、判定不能として結果に残す。
+    FLandscapeMCPFoliageImpact EvaluateFoliage(const FString& Path,const FHeightfieldSnapshot& S,TConstArrayView<uint16> Planned,Foliage::FInventory& Inventory)
+    {
+        FString Error;
+        if(!InspectFoliageIn(Path,S,Inventory,Error)){Inventory={};Inventory.Unknowns.Add(TEXT("FOLIAGE_NOT_INSPECTED: ")+Error);}
+        return Foliage::Evaluate(S,Planned,Inventory);
+    }
+    bool FoliageSafe(const FLandscapeMCPFoliageImpact& F){return F.Verdict==TEXT("NO_FOLIAGE")||F.Verdict==TEXT("SAFE_TO_APPLY");}
+    FString FoliageGateReason(const FLandscapeMCPFoliageImpact& F)
+    {
+        if(F.Verdict==TEXT("UNKNOWN"))
+            return FString::Printf(TEXT("FOLIAGE_UNKNOWN: %d unsupported or unreadable foliage item(s) in or around the edit; foliage safety cannot be proven."),F.UnknownCount+F.Unknowns.Num());
+        if(F.FloatingCount+F.BuriedCount+F.SlopeChangedCount>0)
+            return FString::Printf(TEXT("FOLIAGE_IMPACT: %d foliage instance(s) would float, be buried or stand on a changed slope (float max %.3f cm, bury max %.3f cm). Foliage is never moved; edit elsewhere or move the foliage first."),
+                F.FloatingCount+F.BuriedCount+F.SlopeChangedCount,F.MaxFloatCm,F.MaxBuryCm);
+        return FString::Printf(TEXT("FOLIAGE_SNAP_MODE: FoliageLandscapeSnappingMode is %s; attached foliage could be moved or deleted outside the owned transaction. Only DontSnap is accepted; project settings are not changed by this tool."),*F.SnappingMode);
+    }
+    // Foliageが1つもないWorldでは、v0.4と同じ経路のままにする（遅延更新の明示的な実行をしない）。
+    bool WorldHasFoliage(const FTarget& T)
+    {
+        for(const AInstancedFoliageActor* IFA:LoadedFoliageActors(T.Actor->GetWorld()))
+            for(const auto& Pair:IFA->GetFoliageInfos())if(!Pair.Value->Instances.IsEmpty())return true;
+        return false;
+    }
+#if WITH_DEV_AUTOMATION_TESTS
+    // Automation専用: 最初に見つかったFoliage instanceを本当に動かす（snapと同じPre/PostMoveInstances）。
+    // bTransacted=trueならIFAをModifyしてからなのでUndoで戻り、falseならTransactionの外の変更になり戻らない。
+    void AutomationMoveFoliageInstance(const FTarget& T,bool bTransacted)
+    {
+        check(GIsAutomationTesting);
+        for(AInstancedFoliageActor* IFA:LoadedFoliageActors(T.Actor->GetWorld()))
+                {
+                    bool bMoved=false;
+                    IFA->ForEachFoliageInfo([&](UFoliageType*,FFoliageInfo& Info)
+                    {
+                        if(Info.Instances.IsEmpty())return true;
+                        if(bTransacted)IFA->Modify();
+                        const int32 Index[1]={0};
+                        Info.PreMoveInstances(Index);Info.Instances[0].Location.Z+=10;Info.PostMoveInstances(Index,true);
+                        bMoved=true;return false;
+                    });
+                    if(bMoved)return;
+                }
+    }
+#endif
 }
 bool MutationDisabled(){return bMutationDisabled;}
 #if WITH_DEV_AUTOMATION_TESTS
 bool VerifyAutomationCollision(const FString& Path,const FHeightfieldSnapshot& S,const FPreparedTerrainPlan& P,FString& Error)
-{check(GIsAutomationTesting);FTarget T;if(!Resolve(Path,T,Error))return false;return CollisionMatches(T,S,P,Error);}
+{check(GIsAutomationTesting);FTarget T;if(!Resolve(Path,T,Error,EResolveAccess::Read))return false;return CollisionMatches(T,S,P,Error);}
 void SetAutomationApplyFault(EApplyFault F){check(GIsAutomationTesting);AutomationFault=F;}
-void ResetAutomationApplyState(){check(GIsAutomationTesting);AutomationFault=EApplyFault::None;bMutationDisabled=false;RetryRecords.Reset();}
+void ResetAutomationApplyState(){check(GIsAutomationTesting);AutomationFault=EApplyFault::None;bMutationDisabled=false;bBrushWritesDisabled=false;bAutomationBrushRestoreFailure=false;bAutomationBrushUnrelatedTransaction=false;RetryRecords.Reset();}
 int32 AutomationRetryRecordCount(){check(GIsAutomationTesting);return RetryRecords.Num();}
 #endif
 FString FormatFailureDiagnostic(const FLandscapeMCPTerrainOperationResult& Result,const FString& InStage)
@@ -1018,7 +1603,19 @@ FString FormatFailureDiagnostic(const FLandscapeMCPTerrainOperationResult& Resul
 FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* OutFailureStage)
 {
     if(OutFailureStage)OutFailureStage->Reset();
-    if(R.bDryRun)return Preview(R,OutFailureStage);
+    if(R.bDryRun)
+    {
+        FHeightfieldSnapshot Snapshot;FPreparedTerrainPlan DryPlan;
+        FLandscapeMCPTerrainOperationResult Dry=Preview(R,OutFailureStage,&Snapshot,&DryPlan);
+        if(Dry.bSuccess)
+        {
+            Foliage::FInventory Inventory;
+            Dry.Foliage=EvaluateFoliage(R.LandscapePath,Snapshot,DryPlan.Quantized,Inventory);Dry.Foliage.Evaluation=TEXT("DRY_RUN");
+            if(!FoliageSafe(Dry.Foliage))
+                Dry.Warnings.Add(TEXT("FOLIAGE_")+Dry.Foliage.Verdict+TEXT(": Apply will be refused with FOLIAGE_SAFETY_CONFLICT. See foliage for the affected instances and unknowns."));
+        }
+        return Dry;
+    }
     auto Failed=[&](FLandscapeMCPTerrainOperationResult Result,const FString& FailureCode,const TCHAR* Stage,const FString& Reason)
     {if(OutFailureStage)*OutFailureStage=Stage;return MakeFailure(MoveTemp(Result),FailureCode,Stage,Reason);};
     const double ApplyStart=FPlatformTime::Seconds();
@@ -1047,6 +1644,8 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
             O.Before=O.PlannedAfter=O.ActualAfter;O.TransitionBefore=O.TransitionPlannedAfter=O.TransitionActualAfter;
             O.Delta.MinDeltaCm=O.Delta.MaxDeltaCm=O.Delta.MaxRaiseCm=O.Delta.MaxLowerCm=0;
             for(auto& Sample:O.Path.ProfileSamples)Sample.CurrentHeightCm=Sample.PlannedHeightCm;
+            // 記録された結果のFoliage（過去のApplyの判定と事後検証）は使わない。書き込みはないので、今の地形とFoliageを今回あらためて評価する。
+            {Foliage::FInventory Current;O.Foliage=EvaluateFoliage(R.LandscapePath,Original,TConstArrayView<uint16>(),Current);O.Foliage.Evaluation=TEXT("RETRY_CURRENT_STATE");}
             O.Message=TEXT("retry: Identical request already verified at this source state; no transaction or write.");return O;
         }
         // The terrain or target no longer equals the recorded result (Undo, a
@@ -1063,6 +1662,10 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
     if(!CollisionMatches(Target,Original,Plan,Error))return Failed(O,TEXT("UNSUPPORTED_COLLISION_STATE"),TEXT("beforeCollision"),Error);
     if(!CollisionMatches(Target,Original,Plan,Error,R.Operation==EAuthoringOperation::CreateWalkablePath?R.MaxSlope:0,&Plan.Quantized))
         return Failed(O,TEXT("CANNOT_SATISFY_WALKABILITY"),TEXT("predictedCollision"),Error);
+    // Foliage gate. Foliageを動かすApplyはないため、影響がある・判定できない場合は書き込む前に拒否する。
+    Foliage::FInventory FoliageBefore;
+    O.Foliage=EvaluateFoliage(R.LandscapePath,Original,Plan.Quantized,FoliageBefore);O.Foliage.Evaluation=TEXT("APPLY");
+    if(!FoliageSafe(O.Foliage))return Failed(O,TEXT("FOLIAGE_SAFETY_CONFLICT"),TEXT("foliageGate"),FoliageGateReason(O.Foliage));
     // Allocate the complete retry record before entering the write transaction.
     FRetryRecord Pending;Pending.Request=R;Pending.Identity=Identity;Pending.Plan=Plan;Pending.ResultSnapshot=Original;
     Pending.ResultSnapshot.Heights=Plan.Quantized;
@@ -1074,6 +1677,17 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
     if(bMutationDisabled||!ImmediateRead||!(ImmediateIdentity==Identity)||!SameSnapshot(Original,ImmediateSource)
         ||!CaptureCollateral(Immediate,ImmediateCollateral,Error)||!(Collateral==ImmediateCollateral))
         return Failed(O,TEXT("STALE_PLAN"),TEXT("preWrite"),TEXT("Target, source, safety state, transaction or collateral changed since planning."));
+    // Foliageの再確認: instanceだけでなく、snap mode・範囲のUNKNOWN・走査件数も判定時と同じで、今の状態でも安全と判定されること。
+    Foliage::FInventory FoliageImmediate;FString FoliageError;
+    const bool FoliageRead=InspectFoliageIn(R.LandscapePath,Original,FoliageImmediate,FoliageError);
+#if WITH_DEV_AUTOMATION_TESTS
+    if(Fault(EApplyFault::FoliageStaleSnapMode)){FoliageImmediate.SnappingMode=TEXT("SnapEverywhere");FoliageImmediate.bSnappingSafe=false;}
+    if(Fault(EApplyFault::FoliageStaleUnknown))FoliageImmediate.Unknowns.Add(TEXT("PROCEDURAL_FOLIAGE: automation-injected unknown"));
+#endif
+    if(!FoliageRead||!Foliage::SameSafetyState(FoliageBefore,FoliageImmediate)||!FoliageSafe(Foliage::Evaluate(Original,Plan.Quantized,FoliageImmediate)))
+        return Failed(O,TEXT("FOLIAGE_SAFETY_CONFLICT"),TEXT("preWrite"),FoliageRead
+            ?TEXT("FOLIAGE_STALE: foliage instances, snapping mode or unknown foliage state changed since the foliage gate; nothing was written.")
+            :TEXT("FOLIAGE_STALE: foliage could not be re-inspected before the write; nothing was written. ")+FoliageError);
     const double PreMs=(FPlatformTime::Seconds()-PreStart)*1000;
     if(O.PlannedModifiedCount==0)
     {
@@ -1082,6 +1696,9 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
         O.Status=TEXT("NO_CHANGE");O.Message=TEXT("noChange: Target already satisfies the verified plan; no transaction or write.");
         Pending.Result=O;RememberRetry(MoveTemp(Pending));return O;
     }
+    // 書き込む直前の再検証のため、判定したmaterial・Grassの状態を記録する（Grass以外の対象の状態は事後検証で比べる）。
+    FGrassState GrassBefore;
+    if(!GrassSafe(Target,Error,&GrassBefore))return Failed(O,TEXT("UNSUPPORTED_GRASS_STATE"),TEXT("preWrite"),Error);
     FGuid Owned;FString OwnedContext=TEXT("LandscapeMCP.V04.")+FGuid::NewGuid().ToString();
     const FText Title=FText::FromString(TEXT("Landscape MCP v0.4 ")+O.Operation);
     double WriteMs=0,FlushMs=0;
@@ -1090,24 +1707,45 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
         if(!Transaction.IsOutstanding()||!GUndo)return Failed(O,TEXT("TRANSACTION_FAILED"),TEXT("transaction"),TEXT("Could not start an owned transaction."));
         Owned=GUndo->GetContext().TransactionId;
         if(!Owned.IsValid()){Transaction.Cancel();return Failed(O,TEXT("TRANSACTION_FAILED"),TEXT("transaction"),TEXT("Owned transaction has no valid GUID."));}
-        Target.Actor->Modify();Target.Info->Modify();
+        // Modify()の同期通知でlistenerがmaterialやGrassの状態を変え得る。Modifyは汚れ印なしで先に済ませ、再検証の後に書き込む。
+        Target.Actor->Modify(false);Target.Info->Modify(false);
         const double WriteStart=FPlatformTime::Seconds();
         {
             FScopedSetLandscapeEditingLayer LayerScope(Target.Actor,Target.LayerGuid);
             FLandscapeEditDataInterface EditData(Target.Info,Target.LayerGuid);
+            FGrassState GrassNow;Error.Reset();
+            if(!GrassSafe(Target,Error,&GrassNow)||!(GrassNow==GrassBefore))
+            {
+                Transaction.Cancel();
+                return Failed(O,TEXT("UNSUPPORTED_GRASS_STATE"),TEXT("transaction"),TEXT("Landscape Grass state changed while preparing the write; nothing was written. ")
+                    +(Error.IsEmpty()?FString(TEXT("The Landscape material or its graph changed.")):Error));
+            }
+            // 最後の再検証からSetHeightDataまでの間に、通知を出す処理（MarkPackageDirtyのPackageMarkedDirtyEventなど）を置かない。
             EditData.SetHeightData(Original.Rect.Min.X,Original.Rect.Min.Y,Original.Rect.Max.X,Original.Rect.Max.Y,Plan.Quantized.GetData(),0,false,
                 nullptr,nullptr,nullptr,false,nullptr,nullptr,true,true,true);
             EditData.Flush();
         }
+        // 汚れ印は書き込みの後に付ける。ここでの通知による変化は、事後検証（CaptureTargetのGrass判定を含む）で扱う。
+        Target.Actor->MarkPackageDirty();Target.Info->MarkPackageDirty();
         WriteMs=(FPlatformTime::Seconds()-WriteStart)*1000;
         const double FlushStart=FPlatformTime::Seconds();DerivedUpdate(Target);FlushMs=(FPlatformTime::Seconds()-FlushStart)*1000;
+#if WITH_DEV_AUTOMATION_TESTS
+        if(Fault(EApplyFault::FoliageChangeInTransaction))AutomationMoveFoliageInstance(Target,true);
+#endif
     }
+    // Transaction中に後回しになったLandscapeの更新（Foliageのsnapを含み得る）を、ここで流してから検証する。
+    // 新しい更新は要求しない。Foliageがないなら、v0.4と同じくEditorの次のtickに任せる。
+    const bool bDeferredChecked=WorldHasFoliage(Target);
+    if(bDeferredChecked)Target.Actor->ForceUpdateLayersContent();
+#if WITH_DEV_AUTOMATION_TESTS
+    // 遅延snapと同じく、Transactionの外でinstanceが動いた場合（Undoでは戻らない）。
+    if(Fault(EApplyFault::FoliageChangeOutsideTransaction))AutomationMoveFoliageInstance(Target,false);
+#endif
     const double SourceStart=FPlatformTime::Seconds();FHeightfieldSnapshot Actual;FTarget PostTarget;FIdentity PostIdentity;FCollateral PostCollateral;
     const bool FreshRead=!Fault(EApplyFault::FreshReadFailure)&&ReadSnapshot(R.LandscapePath,Min,Max,Actual,Code,Error);
     if(Fault(EApplyFault::SourceMismatch)&&!Actual.Heights.IsEmpty())Actual.Heights[0]^=1;
-    const bool SourceOK=FreshRead&&Actual.Heights==Plan.Quantized
-        &&CaptureTarget(R.LandscapePath,PostTarget,PostIdentity,Code,Error)&&PostIdentity==Identity
-        &&CaptureCollateral(PostTarget,PostCollateral,Error)&&PostCollateral==Collateral;
+    const bool PostCaptured=CaptureTarget(R.LandscapePath,PostTarget,PostIdentity,Code,Error)&&CaptureCollateral(PostTarget,PostCollateral,Error);
+    const bool SourceOK=FreshRead&&Actual.Heights==Plan.Quantized&&PostCaptured&&PostIdentity==Identity&&PostCollateral==Collateral;
     const double SourceMs=(FPlatformTime::Seconds()-SourceStart)*1000;
     const double GeometryStart=FPlatformTime::Seconds();
     bool GeometryOK=SourceOK&&VerifyPreparedGeometry(R,Original,Actual,Plan,O)&&!Fault(EApplyFault::GeometryMismatch);
@@ -1115,19 +1753,44 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
     const double CollisionStart=FPlatformTime::Seconds();
     const bool CollisionOK=GeometryOK&&CollisionMatches(PostTarget,Actual,Plan,Error,R.Operation==EAuthoringOperation::CreateWalkablePath?R.MaxSlope:0)&&!Fault(EApplyFault::CollisionFailure);
     const double CollisionMs=(FPlatformTime::Seconds()-CollisionStart)*1000;
+    // Foliageの事後検証: instanceが1 bitも変わっていないことと、各instanceのXYで地形が予測どおりであること。
+    Foliage::FInventory FoliageAfter;FLandscapeMCPFoliagePostApply& Post=O.Foliage.PostApply;
+    Post.bChecked=true;Post.bDeferredUpdateChecked=bDeferredChecked;
+    // 範囲内のinstanceの完全一致に加え、全LevelのIFAがbyte単位で同じこと（範囲外のsnapも見逃さない）。
+    Post.bInstancesUnchanged=InspectFoliageIn(R.LandscapePath,Original,FoliageAfter,FoliageError)&&Foliage::SameInstances(FoliageBefore,FoliageAfter)
+        &&PostCaptured&&SameFoliageActors(Collateral,PostCollateral);
+    Post.bTerrainMatchesPrediction=FreshRead;
+    for(const Foliage::FSample& Sample:FoliageAfter.Samples)
+    {
+        double Real=0,RealSlope=0,Predicted=0,PredictedSlope=0;const FVector2D XY(Sample.Location.X,Sample.Location.Y);
+        if(FreshRead&&Foliage::TerrainAt(Actual,Actual.Heights,XY,Real,RealSlope)&&Foliage::TerrainAt(Original,Plan.Quantized,XY,Predicted,PredictedSlope))
+        {Post.MaxPredictionErrorCm=FMath::Max(Post.MaxPredictionErrorCm,FMath::Abs(Real-Predicted));++Post.VerifiedCount;}
+        else Post.bTerrainMatchesPrediction=false;
+    }
+    Post.bTerrainMatchesPrediction&=Post.MaxPredictionErrorCm<=1.e-9;
+    const bool FoliageOK=Post.bInstancesUnchanged&&Post.bTerrainMatchesPrediction;
     const bool ForceRollback=Fault(EApplyFault::UndoFalse)||Fault(EApplyFault::RestoreMismatch)||Fault(EApplyFault::RestoreCollisionFailure)||Fault(EApplyFault::RestoreCodecMismatch)||Fault(EApplyFault::RestoreCollisionStale)
         ||Fault(EApplyFault::OwnershipMismatch)||Fault(EApplyFault::InsertUnrelatedTransaction);
     const FTransactionContext BeforeCommit=GEditor->Trans->GetUndoContext();
     const bool StillOwn=BeforeCommit.TransactionId==Owned&&BeforeCommit.Context==OwnedContext&&BeforeCommit.PrimaryObject==Target.Actor;
-    if(SourceOK&&GeometryOK&&CollisionOK&&StillOwn&&!ForceRollback)
+    if(SourceOK&&GeometryOK&&CollisionOK&&FoliageOK&&StillOwn&&!ForceRollback)
     {
         O.Status=TEXT("APPLIED");O.bSuccess=true;O.ErrorCode.Reset();O.Message=TEXT("applied: Fresh source, geometry and native collision verified; one owned transaction; nothing saved.");
         Pending.Result=O;RememberRetry(MoveTemp(Pending));
         UE_LOG(LogTemp,Display,TEXT("LandscapeMCP timing planningMs=%.3f preWriteMs=%.3f writeMs=%.3f flushMs=%.3f postSourceMs=%.3f geometryMs=%.3f collisionMs=%.3f totalApplyMs=%.3f triangles=%d"),PlanningMs,PreMs,WriteMs,FlushMs,SourceMs,GeometryMs,CollisionMs,(FPlatformTime::Seconds()-ApplyStart)*1000,Plan.Core.Num());
         return O;
     }
-    const FString Failure=SourceOK?(GeometryOK?TEXT("COLLISION_SYNC_FAILED"):TEXT("POST_GEOMETRY_VERIFY_FAILED")):TEXT("POST_VERIFY_FAILED");
-    O=Failed(O,Failure,SourceOK?(GeometryOK?TEXT("postCollision"):TEXT("postGeometry")):TEXT("postSource"),Error.IsEmpty()?TEXT("Post verification failed."):Error);
+    // Foliage自体が変わった場合は、他の検証結果より先にFoliageの問題として報告する（v0.4はFoliageがあると書き込まないので、v0.4の経路には影響しない）。
+    if(!Post.bInstancesUnchanged)
+        O=Failed(O,TEXT("FOLIAGE_SAFETY_CONFLICT"),TEXT("postFoliage"),TEXT("FOLIAGE_POST_VERIFY: foliage instances changed during the edit or the deferred landscape update."));
+    else if(SourceOK&&GeometryOK&&CollisionOK&&!FoliageOK)
+        O=Failed(O,TEXT("FOLIAGE_SAFETY_CONFLICT"),TEXT("postFoliage"),
+            FString::Printf(TEXT("FOLIAGE_POST_VERIFY: terrain under foliage differs from the prediction (max %.6f cm)."),Post.MaxPredictionErrorCm));
+    else
+    {
+        const FString Failure=SourceOK?(GeometryOK?TEXT("COLLISION_SYNC_FAILED"):TEXT("POST_GEOMETRY_VERIFY_FAILED")):TEXT("POST_VERIFY_FAILED");
+        O=Failed(O,Failure,SourceOK?(GeometryOK?TEXT("postCollision"):TEXT("postGeometry")):TEXT("postSource"),Error.IsEmpty()?TEXT("Post verification failed."):Error);
+    }
 #if WITH_DEV_AUTOMATION_TESTS
     if(Fault(EApplyFault::InsertUnrelatedTransaction))
     {FScopedTransaction Other(TEXT("LandscapeMCP.Automation.Unrelated"),INVTEXT("Unrelated Automation transaction"),Target.Actor);Target.Actor->Modify();Target.Actor->SetActorLabel(TEXT("Automation unrelated label edit"));}
@@ -1166,6 +1829,12 @@ FLandscapeMCPTerrainOperationResult Execute(const FPreviewRequest& R,FString* Ou
         Restored=RestoreRead&&RestoredIdentity==Identity&&SameSnapshot(Original,RestoredSource)
             &&CaptureCollateral(RestoredTarget,RestoredCollateral,RestoreError)&&RestoredCollateral==Collateral
             &&CollisionMatches(RestoredTarget,RestoredSource,Plan,RestoreError)&&!Fault(EApplyFault::RestoreCollisionFailure);
+        if(!Restored&&!RestoredCollateral.Objects.IsEmpty()&&!SameFoliageActors(Collateral,RestoredCollateral))
+            RestoreError=TEXT("Foliage instances differ from the original after Undo (a foliage actor changed outside the owned transaction).");
+        // Foliageも書き込み前と完全に一致していなければ、復元を証明できたとはみなさない。
+        Foliage::FInventory FoliageRestored;
+        if(Restored&&!(InspectFoliageIn(R.LandscapePath,Original,FoliageRestored,RestoreError)&&Foliage::SameInstances(FoliageBefore,FoliageRestored)))
+        {Restored=false;if(RestoreError.IsEmpty())RestoreError=TEXT("Foliage instances differ from the original after Undo.");}
     }
     O.Status=Restored?TEXT("ROLLED_BACK"):TEXT("ROLLBACK_FAILED");O.RollbackStatus=Restored?TEXT("VERIFIED"):TEXT("FAILED");
     if(!Restored){bMutationDisabled=true;O.Message+=TEXT("; restoreVerification: ")+(RestoreError.IsEmpty()?FString(TEXT("Restored source, identity, collateral or collision did not match the original, or Undo failed.")):RestoreError);O.Message+=TEXT("; rollback: Restoration could not be proved; v0.4 mutation disabled for this module session.");}

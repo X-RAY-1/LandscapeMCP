@@ -30,5 +30,7 @@ namespace LandscapeMCP::Authoring
     bool VerifyPreparedGeometry(const FPreviewRequest& Request,const FHeightfieldSnapshot& Original,
         const FHeightfieldSnapshot& Actual,const FPreparedTerrainPlan& Plan,FLandscapeMCPTerrainOperationResult& Result);
     // OutFailureStage: validation / snapshot / planning. Never derived from message text.
-    FLandscapeMCPTerrainOperationResult Preview(const FPreviewRequest& Request,FString* OutFailureStage=nullptr);
+    // OutSnapshot / OutPlanは、計画に使った読み取り結果と量子化後の計画（成功時のみ）。Foliageの影響評価に使う。
+    FLandscapeMCPTerrainOperationResult Preview(const FPreviewRequest& Request,FString* OutFailureStage=nullptr,
+        FHeightfieldSnapshot* OutSnapshot=nullptr,FPreparedTerrainPlan* OutPlan=nullptr);
 }

@@ -251,8 +251,13 @@ bool FV04Foliage::RunTest(const FString&)
     if(!TestTrue(TEXT("real attached foliage fixture"),AInstancedFoliageActor::HasFoliageAttached(C->GetCollisionComponent())))return false;
     TArray64<uint8> Before,After;UTexture2D* H=C->GetHeightmap(F.Actor->GetEditLayer(0)->GetGuid());H->Source.GetMipData(Before,0);
     const int32 Count=Info->Instances.Num();const auto Location=Info->Instances[0].Location;const auto Rotation=Info->Instances[0].Rotation;const auto Scale=Info->Instances[0].DrawScale3D;
-    for(EAuthoringOperation Op:{EAuthoringOperation::FlattenRectangle,EAuthoringOperation::FlattenPath,EAuthoringOperation::CreateWalkablePath})
+    // v0.5の契約: Foliageの下の地形を変える編集は拒否する。平坦地のCreateWalkablePathは変更が0頂点で、
+    // Foliageに影響しないためNO_CHANGE（書き込みもTransactionもない）。
+    for(EAuthoringOperation Op:{EAuthoringOperation::FlattenRectangle,EAuthoringOperation::FlattenPath})
         TestEqual(TEXT("existing foliage guard retained"),Execute(F.Request(Op)).ErrorCode,FString(TEXT("FOLIAGE_SAFETY_CONFLICT")));
+    const auto Walk=Execute(F.Request(EAuthoringOperation::CreateWalkablePath));
+    TestTrue(*Walk.Message,Walk.bSuccess);TestEqual(TEXT("flat walkable path is a no-op"),Walk.Status,FString(TEXT("NO_CHANGE")));
+    TestEqual(TEXT("no-op foliage verdict"),Walk.Foliage.Verdict,FString(TEXT("SAFE_TO_APPLY")));
     H->Source.GetMipData(After,0);TestTrue(TEXT("source unchanged"),Before==After);
     TestEqual(TEXT("instance count unchanged"),Info->Instances.Num(),Count);TestEqual(TEXT("instance position unchanged"),Info->Instances[0].Location,Location);
     TestEqual(TEXT("instance rotation unchanged"),Info->Instances[0].Rotation,Rotation);TestTrue(TEXT("instance scale unchanged"),Info->Instances[0].DrawScale3D==Scale);
@@ -834,10 +839,11 @@ bool FV04DiagnosticStage::RunTest(const FString&)
     if(!TestNotNull(TEXT("foliage info"),Info)||!TestNotNull(TEXT("foliage type"),Type))return false;
     FFoliageInstance Instance;Instance.Location=FVector(3000,3000,0);Instance.BaseComponent=C->GetCollisionComponent();
     Info->AddInstance(Type,Instance,C->GetCollisionComponent());
-    const FString DryReason=Check(TEXT("dryRunSnapshotColonReason"),Dry,TEXT("FOLIAGE_SAFETY_CONFLICT"),TEXT("snapshot"));
-    TestTrue(TEXT("colon stays inside the reason"),DryReason.Contains(TEXT("unsupported: editing")));
-    const FString ApplyReason=Check(TEXT("applyResolveColonReason"),F.Request(EAuthoringOperation::FlattenRectangle),TEXT("FOLIAGE_SAFETY_CONFLICT"),TEXT("resolve"));
-    TestTrue(TEXT("apply colon stays inside the reason"),ApplyReason.Contains(TEXT("unsupported: editing")));
+    // v0.5の契約: Foliage付きでもDry-runは成功し、影響をfoliageに返す。Applyは書き込み前のfoliageGateで拒否する。
+    const auto DryResult=Execute(Dry);TestTrue(TEXT("foliage dry run succeeds"),DryResult.bSuccess);
+    TestEqual(TEXT("foliage dry run verdict"),DryResult.Foliage.Verdict,FString(TEXT("BLOCKED")));
+    const FString ApplyReason=Check(TEXT("applyFoliageGateColonReason"),F.Request(EAuthoringOperation::FlattenRectangle),TEXT("FOLIAGE_SAFETY_CONFLICT"),TEXT("foliageGate"));
+    TestTrue(TEXT("apply colon stays inside the reason"),ApplyReason.StartsWith(TEXT("FOLIAGE_IMPACT: ")));
     // The public facade/official adapter path is asserted by the MCP transport client.
     TestEqual(TEXT("no saves"),F.Saves,0);return true;
 }

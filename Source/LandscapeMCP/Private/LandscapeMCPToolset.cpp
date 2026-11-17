@@ -122,3 +122,14 @@ FLandscapeMCPWalkabilityRegionResult ULandscapeMCPToolset::EvaluateWalkabilityRe
 {
     return Publish(LandscapeMCP::WalkabilityRegion(LandscapePath, MinX, MinY, MaxX, MaxY, WalkableFloorAngleDeg));
 }
+
+FLandscapeMCPCapabilitiesResult ULandscapeMCPToolset::GetCapabilities()
+{
+    return Publish(LandscapeMCP::Capabilities());
+}
+
+FLandscapeMCPFoliageInspectResult ULandscapeMCPToolset::InspectFoliage(const FString& LandscapePath, double MinX, double MinY,
+    double MaxX, double MaxY, int32 MaxInstances)
+{
+    return Publish(LandscapeMCP::FoliageInspect(LandscapePath, MinX, MinY, MaxX, MaxY, MaxInstances));
+}

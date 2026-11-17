@@ -272,7 +272,8 @@ bool FV04Schema::RunTest(const FString& Parameters)
     if(!TestTrue(TEXT("official tag baseline fixture"),FFileHelper::LoadFileToString(BaselineText,*Fixture)))return false;
     if(!TestTrue(TEXT("baseline JSON"),FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(BaselineText),Baseline)))return false;
     if(!Current.IsValid())return false;
-    const auto& Tools=Current->GetArrayField(TEXT("tools"));TestEqual(TEXT("13 tools"),Tools.Num(),13);
+    // v0.5の契約: v0.4.0の13 ToolにGetCapabilitiesとInspectFoliageを加えた15 Tool。既存Toolの比較は下で続ける。
+    const auto& Tools=Current->GetArrayField(TEXT("tools"));TestEqual(TEXT("13 v0.4.0 tools plus GetCapabilities and InspectFoliage"),Tools.Num(),15);
     for(const auto& Old:Baseline->GetArrayField(TEXT("tools")))
     {
         bool Found=false;for(const auto& Tool:Tools)
@@ -293,7 +294,7 @@ bool FV04Schema::RunTest(const FString& Parameters)
             }
         TestTrue(TEXT("old tool retained"),Found);
     }
-    TestEqual(TEXT("version"),Current->GetStringField(TEXT("version")),FString(TEXT("0.4")));
+    TestEqual(TEXT("version"),Current->GetStringField(TEXT("version")),FString(TEXT("0.5")));
     for(const auto& Tool:Tools)
     {
         const auto Obj=Tool->AsObject();const FString N=Obj->GetStringField(TEXT("name"));
