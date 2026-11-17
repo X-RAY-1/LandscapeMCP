@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 — 未リリース（RC4: 2026-11-17。公開日は公開時に記入）
+## v0.5.0 — 2026-11-17
 
 Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できるようにしました。Foliageを動かす・消す・置き直すApplyはありません。Foliageに影響する編集や、影響を判断できない編集は、書き込まずに拒否します。
 
@@ -50,6 +50,8 @@ Foliageが付いたLandscapeを、Foliageを壊さずに解析・編集できる
 - `GetHeight`などの読み取りToolの高さは、従来どおりbilinear補間（Foliage Safetyの高さの定義とは別）
 - Landscape Grass（Grass Output・Grass Type）を使うLandscapeへの編集は非対応（Applyは拒否）。安全な対応は将来のバージョンで検討中で、時期は未定
 - Water System・Splineを使った川・道路などの検出、保護領域の設定、地形の変更に合わせた自動追従は非対応。関連するActorや形状が維持されることは保証しない。編集禁止領域、影響の評価、自動追従は将来の検討事項で、時期は未定
+- rollbackの照合は、Grassの状態と、解析で辿る定義済みの参照構造（material、Material Instanceの親、material function、expressionの並び）の一致を確かめるもの。expressionの値（定数など）を含む、materialのすべてのpropertyの完全な復元を保証するものではない
+- 既知の問題: v0.4の3 Toolで書き込み後にGrassの状態が変わった場合、`errorCode`は`UNSUPPORTED_GRASS_STATE`ではなく`FOLIAGE_SAFETY_CONFLICT`（`FOLIAGE_POST_VERIFY`）になる。rollbackとlatchは正しく動作する。分類の修正は後続のバージョンで検討する
 - Windowsでは長いパスでBuildが失敗する場合がある。READMEのInstallationに注意を追加
 - 検証済みの環境はUnreal Engine 5.8 / Windows 64-bit
 

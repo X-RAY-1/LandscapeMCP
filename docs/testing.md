@@ -349,7 +349,7 @@ RC3の独立レビュー（MAJOR 1件、MINOR 1件）を受けて、最後の再
 | 項目 | 結果 |
 |---|---|
 | Build（clean build） | 成功。警告はRC1〜RC3と同じ（C4701が4件） |
-| 反例の構成（1構成1 process、28件） | 修正後は28件すべてSuccess。timeout・crashなし |
+| 反例の構成（1構成1 process、28件） | 修正前（RC3のDLL）は14件Fail・14件Success。Failのうち、最新のUndoの記録が自分のものでない構成（O1）のclean・dirtyの2件は、RC3にhookがなく構成を作れない対象外のケースで、RC3の欠陥の再現ではない（RC3の欠陥を再現したのは12件）。修正後は28件すべてSuccess。timeout・crashなし |
 | 限定suite（`V05.Resolve.*`、`V04.Safety.GrassGuardAndOuterTransaction`、`V05.Foliage.UnknownForms`） | 58件すべてSuccess、警告0 |
 | Automation | 143件すべてSuccess、失敗0、未実行0。警告1件はEngineのネットワーク到達確認（`LogHttp`のtimeout）で、本Pluginとは無関係 |
 | MCP HTTPの往復 | v0.4・v0.5とも成功 |
